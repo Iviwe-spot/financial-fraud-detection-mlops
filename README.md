@@ -35,6 +35,16 @@ The generator writes Parquet files to `data/raw/` and small CSV previews to `dat
 
 All randomness flows from a single NumPy seed. Re-running the same command with the same configuration and seed produces the same records.
 
-## Next stage
+## Fraud injection
 
-Add `fraud_injector.py` as a separate component that reads the normal baseline and injects labelled account-takeover, card-testing, velocity, geographic, international, merchant, night-time, and balance-draining events.
+The project currently supports two composable fraud typologies:
+
+| Fraud typology | Synthetic behaviour |
+|---|---|
+| Account Takeover | New device, unusually large customer-relative amounts, unusual activity hours and multiple rapid transactions |
+| Card Testing | New device and a rapid burst of small transactions between R1 and R20 |
+
+Generate the fraud-labelled development dataset with:
+
+```bash
+python pipelines/inject_fraud.py
