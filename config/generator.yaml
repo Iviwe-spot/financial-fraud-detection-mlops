@@ -1,0 +1,9 @@
+seed: 42
+n_customers: 50000
+n_accounts: 70000
+n_transactions: 100000
+start_date: "2025-01-01"
+end_date: "2026-06-30"
+csv_sample_rows: 1000
+output_dir: "data/raw"
+sample_dir: "data/sample"
