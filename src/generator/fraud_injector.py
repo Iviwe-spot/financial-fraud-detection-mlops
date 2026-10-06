@@ -8,6 +8,7 @@ FRAUD_TYPE_ACCOUNT_TAKEOVER = "ACCOUNT_TAKEOVER"
 FRAUD_TYPE_CARD_TESTING = "CARD_TESTING"
 FRAUD_TYPE_VELOCITY_ATTACK = "VELOCITY_ATTACK"
 FRAUD_TYPE_ABNORMAL_AMOUNT = "ABNORMAL_AMOUNT"
+FRAUD_TYPE_GEOGRAPHIC_ANOMALY = "GEOGRAPHIC_ANOMALY"
 
 CARD_TESTING_MIN_AMOUNT = 1.00
 CARD_TESTING_MAX_AMOUNT = 20.00
@@ -1372,6 +1373,484 @@ def inject_abnormal_amount(
                 "is_fraud": 1,
                 "fraud_type": (
                     FRAUD_TYPE_ABNORMAL_AMOUNT
+                ),
+                "fraud_scenario_id": scenario_id,
+            }
+        )
+
+    return _combine_baseline_and_fraud(
+        baseline=baseline,
+        fraudulent_rows=fraudulent_rows,
+    )
+def inject_geographic_anomaly(
+    transactions: pd.DataFrame,
+    accounts: pd.DataFrame,
+    customers: pd.DataFrame,
+    n_scenarios: int = 40,
+    min_minutes_after_previous: int = 5,
+    max_minutes_after_previous: int = 45,
+    seed: int = 46,
+) -> pd.DataFrame:
+    """
+    Inject synthetic Geographic Anomaly / Impossible Travel fraud.
+
+    Each scenario creates one fraudulent transaction in a South African
+    province different from the customer's most recent legitimate domestic
+    transaction, after an implausibly short time interval.
+
+    The scenario deliberately avoids relying on new devices, abnormal
+    amounts, or transaction bursts. The primary signal is the combination
+    of geographic displacement and a short elapsed time.
+
+    Accounts already involved in existing fraud scenarios are excluded.
+    Existing fraud labels are preserved.
+    """
+
+    if n_scenarios <= 0:
+        raise ValueError(
+            "n_scenarios must be greater than zero"
+        )
+
+    if min_minutes_after_previous <= 0:
+        raise ValueError(
+            "min_minutes_after_previous must be greater than zero"
+        )
+
+    if (
+        max_minutes_after_previous
+        < min_minutes_after_previous
+    ):
+        raise ValueError(
+            "max_minutes_after_previous must be greater than "
+            "or equal to min_minutes_after_previous"
+        )
+
+    _validate_transaction_columns(transactions)
+
+    rng = np.random.default_rng(seed)
+
+    baseline = transactions.copy(deep=True)
+    account_master = accounts.copy(deep=True)
+    customer_master = customers.copy(deep=True)
+
+    # ---------------------------------------------------------
+    # Ensure fraud ground-truth columns exist
+    # ---------------------------------------------------------
+
+    if "is_fraud" not in baseline.columns:
+        baseline["is_fraud"] = 0
+
+    if "fraud_type" not in baseline.columns:
+        baseline["fraud_type"] = None
+
+    if "fraud_scenario_id" not in baseline.columns:
+        baseline["fraud_scenario_id"] = None
+
+    # ---------------------------------------------------------
+    # Legitimate history only
+    # ---------------------------------------------------------
+
+    legitimate = baseline[
+        baseline["is_fraud"] == 0
+    ].copy()
+
+    legitimate["timestamp"] = pd.to_datetime(
+        legitimate["timestamp"]
+    )
+
+    # ---------------------------------------------------------
+    # Exclude accounts already used by another fraud typology
+    # ---------------------------------------------------------
+
+    compromised_accounts = set(
+        baseline.loc[
+            baseline["is_fraud"] == 1,
+            "account_id",
+        ]
+    )
+
+    eligible_accounts = _get_eligible_accounts(
+        baseline=legitimate,
+        accounts=account_master,
+    )
+
+    eligible_accounts = eligible_accounts[
+        ~eligible_accounts["account_id"].isin(
+            compromised_accounts
+        )
+    ].copy()
+
+    # ---------------------------------------------------------
+    # Identify accounts with usable balances
+    # ---------------------------------------------------------
+
+    latest_balances = (
+        legitimate
+        .sort_values("timestamp")
+        .groupby(
+            "account_id",
+            as_index=False,
+        )
+        .tail(1)[
+            [
+                "account_id",
+                "balance_after",
+            ]
+        ]
+        .rename(
+            columns={
+                "balance_after": "latest_balance"
+            }
+        )
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        latest_balances,
+        on="account_id",
+        how="inner",
+    )
+
+    eligible_accounts = eligible_accounts[
+        eligible_accounts["latest_balance"] > 100.0
+    ].copy()
+
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    # Require legitimate domestic history before sampling.
+    #
+    # This prevents INTERNATIONAL from becoming the geographic
+    # anchor for a province-level impossible-travel scenario.
+    # ---------------------------------------------------------
+
+    domestic_legitimate = legitimate[
+        (
+            legitimate["country"]
+            == "South Africa"
+        )
+        & (
+            legitimate["province"].notna()
+        )
+        & (
+            legitimate["province"]
+            != "INTERNATIONAL"
+        )
+    ].copy()
+
+    domestic_accounts = set(
+        domestic_legitimate["account_id"]
+    )
+
+    eligible_accounts = eligible_accounts[
+        eligible_accounts["account_id"].isin(
+            domestic_accounts
+        )
+    ].copy()
+
+    if n_scenarios > len(eligible_accounts):
+        raise ValueError(
+            "n_scenarios cannot exceed the number of "
+            "eligible uncompromised active accounts with "
+            "legitimate domestic history"
+        )
+
+    # ---------------------------------------------------------
+    # Select victim accounts
+    # ---------------------------------------------------------
+
+    victim_indices = rng.choice(
+        eligible_accounts.index.to_numpy(),
+        size=n_scenarios,
+        replace=False,
+    )
+
+    victims = (
+        eligible_accounts
+        .loc[victim_indices]
+        .reset_index(drop=True)
+    )
+
+    south_african_provinces = [
+        "Eastern Cape",
+        "Free State",
+        "Gauteng",
+        "KwaZulu-Natal",
+        "Limpopo",
+        "Mpumalanga",
+        "North West",
+        "Northern Cape",
+        "Western Cape",
+    ]
+
+    fraudulent_rows: list[dict] = []
+
+    # ---------------------------------------------------------
+    # Generate one fraud transaction per scenario
+    # ---------------------------------------------------------
+
+    for scenario_number, victim in victims.iterrows():
+        account_id = victim["account_id"]
+        customer_id = victim["customer_id"]
+
+        customer_rows = customer_master[
+            customer_master["customer_id"]
+            == customer_id
+        ]
+
+        if customer_rows.empty:
+            continue
+
+        customer = customer_rows.iloc[0]
+
+        # All legitimate customer history is still useful for
+        # devices and normal transaction metadata.
+        customer_history = legitimate[
+            legitimate["customer_id"]
+            == customer_id
+        ].sort_values("timestamp")
+
+        account_history = legitimate[
+            legitimate["account_id"]
+            == account_id
+        ].sort_values("timestamp")
+
+        if (
+            customer_history.empty
+            or account_history.empty
+        ):
+            continue
+
+        # -----------------------------------------------------
+        # Domestic geographic anchor
+        # -----------------------------------------------------
+
+        domestic_history = customer_history[
+            (
+                customer_history["country"]
+                == "South Africa"
+            )
+            & (
+                customer_history["province"].notna()
+            )
+            & (
+                customer_history["province"]
+                != "INTERNATIONAL"
+            )
+        ].sort_values("timestamp")
+
+        if domestic_history.empty:
+            continue
+
+        previous_transaction = (
+            domestic_history.iloc[-1]
+        )
+
+        previous_timestamp = pd.Timestamp(
+            previous_transaction["timestamp"]
+        )
+
+        previous_province = str(
+            previous_transaction["province"]
+        )
+
+        candidate_provinces = [
+            province
+            for province in south_african_provinces
+            if province != previous_province
+        ]
+
+        if not candidate_provinces:
+            continue
+
+        fraud_province = str(
+            rng.choice(
+                candidate_provinces
+            )
+        )
+
+        # -----------------------------------------------------
+        # Create impossible-travel time gap
+        # -----------------------------------------------------
+
+        minutes_after_previous = int(
+            rng.integers(
+                min_minutes_after_previous,
+                max_minutes_after_previous + 1,
+            )
+        )
+
+        fraud_timestamp = (
+            previous_timestamp
+            + pd.Timedelta(
+                minutes=minutes_after_previous
+            )
+        )
+
+        # -----------------------------------------------------
+        # Normal-looking customer-relative amount
+        # -----------------------------------------------------
+
+        customer_average = max(
+            float(
+                customer["avg_transaction"]
+            ),
+            1.0,
+        )
+
+        customer_std = max(
+            float(
+                customer["std_transaction"]
+            ),
+            1.0,
+        )
+
+        proposed_amount = float(
+            rng.normal(
+                loc=customer_average,
+                scale=max(
+                    customer_std * 0.5,
+                    1.0,
+                ),
+            )
+        )
+
+        minimum_amount = max(
+            customer_average * 0.25,
+            25.0,
+        )
+
+        maximum_amount = max(
+            minimum_amount,
+            customer_average
+            + customer_std,
+        )
+
+        proposed_amount = float(
+            np.clip(
+                proposed_amount,
+                minimum_amount,
+                maximum_amount,
+            )
+        )
+
+        current_balance = float(
+            account_history.iloc[-1][
+                "balance_after"
+            ]
+        )
+
+        if current_balance < minimum_amount:
+            continue
+
+        amount = min(
+            proposed_amount,
+            current_balance,
+        )
+
+        amount = round(
+            max(
+                float(amount),
+                0.01,
+            ),
+            2,
+        )
+
+        # -----------------------------------------------------
+        # Reuse known device
+        # -----------------------------------------------------
+
+        known_devices = (
+            customer_history[
+                "device_id"
+            ]
+            .dropna()
+            .unique()
+        )
+
+        if len(known_devices) > 0:
+            device_id = str(
+                rng.choice(
+                    known_devices
+                )
+            )
+        else:
+            device_id = (
+                f"GEO_DEVICE_"
+                f"{scenario_number + 1:06d}"
+            )
+
+        # -----------------------------------------------------
+        # Reuse plausible legitimate transaction metadata
+        # -----------------------------------------------------
+
+        reference_transaction = (
+            customer_history.iloc[
+                int(
+                    rng.integers(
+                        0,
+                        len(customer_history),
+                    )
+                )
+            ]
+        )
+
+        balance_before = round(
+            current_balance,
+            2,
+        )
+
+        balance_after = round(
+            max(
+                balance_before - amount,
+                0.0,
+            ),
+            2,
+        )
+
+        scenario_id = (
+            f"GEO_"
+            f"{scenario_number + 1:06d}"
+        )
+
+        fraudulent_rows.append(
+            {
+                "transaction_id": (
+                    f"FRAUD_GEO_"
+                    f"{scenario_number + 1:06d}"
+                ),
+                "account_id": account_id,
+                "customer_id": customer_id,
+                "timestamp": fraud_timestamp,
+                "amount": amount,
+                "merchant": (
+                    reference_transaction[
+                        "merchant"
+                    ]
+                ),
+                "merchant_category": (
+                    reference_transaction[
+                        "merchant_category"
+                    ]
+                ),
+                "transaction_type": (
+                    reference_transaction[
+                        "transaction_type"
+                    ]
+                ),
+                "channel": (
+                    reference_transaction[
+                        "channel"
+                    ]
+                ),
+                "device_id": device_id,
+                "province": fraud_province,
+                "country": "South Africa",
+                "is_international": False,
+                "direction": "DEBIT",
+                "balance_before": balance_before,
+                "balance_after": balance_after,
+                "is_fraud": 1,
+                "fraud_type": (
+                    FRAUD_TYPE_GEOGRAPHIC_ANOMALY
                 ),
                 "fraud_scenario_id": scenario_id,
             }

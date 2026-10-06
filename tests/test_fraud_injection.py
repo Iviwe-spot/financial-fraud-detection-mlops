@@ -6,10 +6,12 @@ from src.generator.fraud_injector import (
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
     FRAUD_TYPE_CARD_TESTING,
     FRAUD_TYPE_VELOCITY_ATTACK,
+    FRAUD_TYPE_GEOGRAPHIC_ANOMALY,
     inject_abnormal_amount,
     inject_account_takeover,
     inject_card_testing,
     inject_velocity_attack,
+    inject_geographic_anomaly,
 )
 
 
@@ -838,6 +840,211 @@ def test_abnormal_amount_is_reproducible():
         customers,
         n_scenarios=1,
         seed=45,
+    )
+
+    assert_frame_equal(first, second)
+
+def test_geographic_anomaly_adds_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
+    ]
+
+    assert len(fraud) == 1
+    assert (fraud["is_fraud"] == 1).all()
+
+
+def test_geographic_anomaly_changes_province():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
+    ].iloc[0]
+
+    legitimate_history = (
+        transactions[
+            transactions["customer_id"]
+            == fraud["customer_id"]
+        ]
+        .sort_values("timestamp")
+    )
+
+    previous_transaction = (
+        legitimate_history.iloc[-1]
+    )
+
+    assert (
+        fraud["province"]
+        != previous_transaction["province"]
+    )
+
+
+def test_geographic_anomaly_occurs_soon_after_previous():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        min_minutes_after_previous=5,
+        max_minutes_after_previous=45,
+        seed=46,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
+    ].iloc[0]
+
+    legitimate_history = (
+        transactions[
+            transactions["customer_id"]
+            == fraud["customer_id"]
+        ]
+        .sort_values("timestamp")
+    )
+
+    previous_timestamp = pd.Timestamp(
+        legitimate_history.iloc[-1]["timestamp"]
+    )
+
+    gap = (
+        pd.Timestamp(fraud["timestamp"])
+        - previous_timestamp
+    )
+
+    assert gap >= pd.Timedelta(minutes=5)
+    assert gap <= pd.Timedelta(minutes=45)
+
+
+def test_geographic_anomaly_reuses_known_device():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
+    ].iloc[0]
+
+    known_devices = set(
+        transactions.loc[
+            transactions["customer_id"]
+            == fraud["customer_id"],
+            "device_id",
+        ]
+    )
+
+    assert fraud["device_id"] in known_devices
+
+
+def test_geographic_anomaly_is_single_transaction():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
+    ]
+
+    scenario_sizes = (
+        fraud
+        .groupby("fraud_scenario_id")
+        .size()
+    )
+
+    assert (scenario_sizes == 1).all()
+
+
+def test_geographic_anomaly_excludes_compromised_account():
+    customers, accounts, transactions = _sample_data()
+
+    with_ato = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    compromised_accounts = set(
+        with_ato.loc[
+            with_ato["is_fraud"] == 1,
+            "account_id",
+        ]
+    )
+
+    combined = inject_geographic_anomaly(
+        with_ato,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    geographic_accounts = set(
+        combined.loc[
+            combined["fraud_type"]
+            == FRAUD_TYPE_GEOGRAPHIC_ANOMALY,
+            "account_id",
+        ]
+    )
+
+    assert compromised_accounts.isdisjoint(
+        geographic_accounts
+    )
+
+
+def test_geographic_anomaly_is_reproducible():
+    customers, accounts, transactions = _sample_data()
+
+    first = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
+    )
+
+    second = inject_geographic_anomaly(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=46,
     )
 
     assert_frame_equal(first, second)
