@@ -4,8 +4,10 @@ from pandas.testing import assert_frame_equal
 from src.generator.fraud_injector import (
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
     FRAUD_TYPE_CARD_TESTING,
+    FRAUD_TYPE_VELOCITY_ATTACK,
     inject_account_takeover,
     inject_card_testing,
+    inject_velocity_attack,
 )
 
 
@@ -486,3 +488,153 @@ def test_card_testing_preserves_existing_fraud():
         combined["fraud_type"]
         == FRAUD_TYPE_CARD_TESTING
     ).any()
+
+def test_velocity_attack_adds_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_velocity_attack(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=44,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_VELOCITY_ATTACK
+    ]
+
+    assert not fraud.empty
+    assert (fraud["is_fraud"] == 1).all()
+
+
+def test_velocity_attack_creates_rapid_burst():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_velocity_attack(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        min_transactions=6,
+        max_transactions=6,
+        seed=44,
+    )
+
+    fraud = (
+        result[
+            result["fraud_type"]
+            == FRAUD_TYPE_VELOCITY_ATTACK
+        ]
+        .sort_values("timestamp")
+    )
+
+    assert len(fraud) == 6
+
+    gaps = fraud["timestamp"].diff().dropna()
+
+    assert (
+        gaps >= pd.Timedelta(seconds=30)
+    ).all()
+
+    assert (
+        gaps <= pd.Timedelta(seconds=120)
+    ).all()
+
+
+def test_velocity_attack_is_not_card_testing():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_velocity_attack(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        min_transactions=5,
+        max_transactions=5,
+        seed=44,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_VELOCITY_ATTACK
+    ]
+
+    assert not fraud.empty
+    assert (fraud["amount"] > 20.00).all()
+
+
+def test_velocity_attack_preserves_existing_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    with_ato = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    with_card_testing = inject_card_testing(
+        with_ato,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=43,
+    )
+
+    ato_before = (
+        with_card_testing["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ).sum()
+
+    card_before = (
+        with_card_testing["fraud_type"]
+        == FRAUD_TYPE_CARD_TESTING
+    ).sum()
+
+    combined = inject_velocity_attack(
+        with_card_testing,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=44,
+    )
+
+    assert (
+        combined["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ).sum() == ato_before
+
+    assert (
+        combined["fraud_type"]
+        == FRAUD_TYPE_CARD_TESTING
+    ).sum() == card_before
+
+    assert (
+        combined["fraud_type"]
+        == FRAUD_TYPE_VELOCITY_ATTACK
+    ).any()
+
+
+def test_velocity_attack_is_reproducible():
+    customers, accounts, transactions = _sample_data()
+
+    first = inject_velocity_attack(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=44,
+    )
+
+    second = inject_velocity_attack(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=44,
+    )
+
+    assert_frame_equal(first, second)

@@ -6,6 +6,7 @@ import pandas as pd
 
 FRAUD_TYPE_ACCOUNT_TAKEOVER = "ACCOUNT_TAKEOVER"
 FRAUD_TYPE_CARD_TESTING = "CARD_TESTING"
+FRAUD_TYPE_VELOCITY_ATTACK = "VELOCITY_ATTACK"
 
 CARD_TESTING_MIN_AMOUNT = 1.00
 CARD_TESTING_MAX_AMOUNT = 20.00
@@ -588,6 +589,437 @@ def inject_card_testing(
         fraudulent_rows=fraudulent_rows,
     )
 
+def inject_velocity_attack(
+    transactions: pd.DataFrame,
+    accounts: pd.DataFrame,
+    customers: pd.DataFrame,
+    n_scenarios: int = 50,
+    min_transactions: int = 5,
+    max_transactions: int = 10,
+    seed: int = 44,
+) -> pd.DataFrame:
+    """
+    Inject synthetic Velocity Attack fraud.
+
+    A Velocity Attack consists of multiple customer-plausible
+    transactions occurring within an abnormally short period.
+
+    Unlike Card Testing:
+
+    - amounts remain plausible for the customer;
+    - a known customer device is reused where possible;
+    - the primary anomaly is transaction frequency;
+    - transactions occur 30-120 seconds apart.
+
+    Existing fraud labels are preserved. Behavioural profiles are
+    derived only from legitimate transaction history.
+
+    The source DataFrames are not modified.
+    """
+
+    _validate_parameters(
+        n_scenarios=n_scenarios,
+        min_transactions=min_transactions,
+        max_transactions=max_transactions,
+    )
+
+    _validate_transaction_columns(transactions)
+
+    rng = np.random.default_rng(seed)
+
+    baseline = transactions.copy(deep=True)
+    account_master = accounts.copy(deep=True)
+    customer_master = customers.copy(deep=True)
+
+    # Add fraud labels only when they do not already exist.
+    if "is_fraud" not in baseline.columns:
+        baseline["is_fraud"] = 0
+
+    if "fraud_type" not in baseline.columns:
+        baseline["fraud_type"] = None
+
+    if "fraud_scenario_id" not in baseline.columns:
+        baseline["fraud_scenario_id"] = None
+
+    # Behavioural profiles must only use legitimate history.
+    legitimate = baseline[
+        baseline["is_fraud"] == 0
+    ].copy()
+
+    eligible_accounts = _get_eligible_accounts(
+        baseline=legitimate,
+        accounts=account_master,
+    )
+
+    # Use the latest balance from all existing transactions.
+    # This includes any previously injected fraud and therefore
+    # preserves composability between fraud typologies.
+    latest_account_rows = (
+        baseline
+        .sort_values("timestamp")
+        .groupby(
+            "account_id",
+            as_index=False,
+        )
+        .tail(1)
+    )
+
+    latest_account_state = (
+        latest_account_rows[
+            [
+                "account_id",
+                "timestamp",
+                "balance_after",
+            ]
+        ]
+        .rename(
+            columns={
+                "timestamp": "latest_timestamp",
+                "balance_after": "latest_balance",
+            }
+        )
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        latest_account_state,
+        on="account_id",
+        how="inner",
+    )
+
+    # Add customer behavioural profiles so that accounts with
+    # insufficient balances can be excluded before selection.
+    customer_profiles = customer_master[
+        [
+            "customer_id",
+            "avg_transaction",
+            "std_transaction",
+        ]
+    ].copy()
+
+    customer_profiles["avg_transaction"] = (
+        customer_profiles["avg_transaction"]
+        .astype(float)
+        .clip(lower=1.0)
+    )
+
+    customer_profiles["std_transaction"] = (
+        customer_profiles["std_transaction"]
+        .astype(float)
+        .clip(lower=1.0)
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        customer_profiles,
+        on="customer_id",
+        how="inner",
+    )
+
+    # A Velocity Attack transaction is capped at 1.5 times the
+    # customer's normal average. This condition guarantees enough
+    # balance for the maximum requested number of transactions.
+    eligible_accounts[
+        "maximum_velocity_amount"
+    ] = (
+        eligible_accounts["avg_transaction"]
+        * 1.50
+    )
+
+    eligible_accounts[
+        "minimum_required_balance"
+    ] = (
+        eligible_accounts[
+            "maximum_velocity_amount"
+        ]
+        * max_transactions
+    )
+
+    eligible_accounts = eligible_accounts[
+        eligible_accounts["latest_balance"]
+        >= eligible_accounts[
+            "minimum_required_balance"
+        ]
+    ].copy()
+
+    if n_scenarios > len(eligible_accounts):
+        raise ValueError(
+            "n_scenarios cannot exceed the number of "
+            "eligible active accounts with sufficient balance"
+        )
+
+    victim_indices = rng.choice(
+        eligible_accounts.index.to_numpy(),
+        size=n_scenarios,
+        replace=False,
+    )
+
+    victims = (
+        eligible_accounts
+        .loc[victim_indices]
+        .reset_index(drop=True)
+    )
+
+    fraudulent_rows: list[dict] = []
+
+    for scenario_number, victim in victims.iterrows():
+        account_id = victim["account_id"]
+        customer_id = victim["customer_id"]
+
+        customer_rows = customer_master[
+            customer_master["customer_id"]
+            == customer_id
+        ]
+
+        if customer_rows.empty:
+            continue
+
+        customer = customer_rows.iloc[0]
+
+        # Legitimate history supplies behavioural evidence.
+        customer_history = legitimate[
+            legitimate["customer_id"]
+            == customer_id
+        ].sort_values("timestamp")
+
+        legitimate_account_history = (
+            customer_history[
+                customer_history["account_id"]
+                == account_id
+            ]
+            .sort_values("timestamp")
+        )
+
+        # All account history supplies the latest operational state.
+        complete_account_history = (
+            baseline[
+                baseline["account_id"]
+                == account_id
+            ]
+            .sort_values("timestamp")
+        )
+
+        if (
+            customer_history.empty
+            or legitimate_account_history.empty
+            or complete_account_history.empty
+        ):
+            continue
+
+        scenario_id = (
+            f"VELOCITY_{scenario_number + 1:06d}"
+        )
+
+        number_of_transactions = int(
+            rng.integers(
+                min_transactions,
+                max_transactions + 1,
+            )
+        )
+
+        last_timestamp = pd.Timestamp(
+            complete_account_history.iloc[-1][
+                "timestamp"
+            ]
+        )
+
+        # Start after the latest existing account transaction.
+        # Do not force the event backwards into the baseline period.
+        start_timestamp = (
+            last_timestamp
+            + pd.Timedelta(
+                hours=int(rng.integers(1, 25))
+            )
+        )
+
+        customer_average = max(
+            float(customer["avg_transaction"]),
+            1.0,
+        )
+
+        customer_std = max(
+            float(customer["std_transaction"]),
+            1.0,
+        )
+
+        current_balance = float(
+            complete_account_history.iloc[-1][
+                "balance_after"
+            ]
+        )
+
+        # Reuse an existing legitimate device where possible.
+        known_devices = (
+            customer_history["device_id"]
+            .dropna()
+            .astype(str)
+            .unique()
+        )
+
+        if len(known_devices) > 0:
+            device_id = str(
+                rng.choice(known_devices)
+            )
+        else:
+            device_id = (
+                f"KNOWN_DEVICE_{customer_id}"
+            )
+
+        # Use legitimate transaction contexts to avoid introducing
+        # an artificial merchant or channel shortcut.
+        context_candidates = (
+            customer_history[
+                customer_history[
+                    "transaction_type"
+                ] == "PURCHASE"
+            ]
+        )
+
+        if context_candidates.empty:
+            context_candidates = (
+                customer_history.copy()
+            )
+
+        previous_timestamp = start_timestamp
+
+        for sequence_number in range(
+            number_of_transactions
+        ):
+            if sequence_number == 0:
+                fraud_timestamp = start_timestamp
+            else:
+                fraud_timestamp = (
+                    previous_timestamp
+                    + pd.Timedelta(
+                        seconds=int(
+                            rng.integers(30, 121)
+                        )
+                    )
+                )
+
+            previous_timestamp = fraud_timestamp
+
+            # Reduce the variance so that individual amounts remain
+            # plausible. The main signal should be transaction speed.
+            proposed_amount = float(
+                rng.normal(
+                    loc=customer_average,
+                    scale=max(
+                        customer_std * 0.35,
+                        customer_average * 0.10,
+                    ),
+                )
+            )
+
+            minimum_amount = max(
+                customer_average * 0.50,
+                1.00,
+            )
+
+            maximum_amount = max(
+                customer_average * 1.50,
+                minimum_amount,
+            )
+
+            amount = float(
+                np.clip(
+                    proposed_amount,
+                    minimum_amount,
+                    maximum_amount,
+                )
+            )
+
+            amount = round(
+                min(
+                    amount,
+                    current_balance,
+                ),
+                2,
+            )
+
+            balance_before = round(
+                current_balance,
+                2,
+            )
+
+            balance_after = round(
+                max(
+                    balance_before - amount,
+                    0.0,
+                ),
+                2,
+            )
+
+            # Reuse a legitimate merchant/category/channel context.
+            context_index = int(
+                rng.integers(
+                    0,
+                    len(context_candidates),
+                )
+            )
+
+            context = (
+                context_candidates.iloc[
+                    context_index
+                ]
+            )
+
+            fraudulent_rows.append(
+                {
+                    "transaction_id": (
+                        f"FRAUD_VELOCITY_"
+                        f"{scenario_number + 1:06d}_"
+                        f"{sequence_number + 1:02d}"
+                    ),
+                    "account_id": account_id,
+                    "customer_id": customer_id,
+                    "timestamp": fraud_timestamp,
+                    "amount": amount,
+                    "merchant": context[
+                        "merchant"
+                    ],
+                    "merchant_category": context[
+                        "merchant_category"
+                    ],
+                    "transaction_type": (
+                        "PURCHASE"
+                    ),
+                    "channel": context[
+                        "channel"
+                    ],
+                    "device_id": device_id,
+                    "province": context[
+                        "province"
+                    ],
+                    "country": context[
+                        "country"
+                    ],
+                    "is_international": bool(
+                        context[
+                            "is_international"
+                        ]
+                    ),
+                    "direction": "DEBIT",
+                    "balance_before": (
+                        balance_before
+                    ),
+                    "balance_after": (
+                        balance_after
+                    ),
+                    "is_fraud": 1,
+                    "fraud_type": (
+                        FRAUD_TYPE_VELOCITY_ATTACK
+                    ),
+                    "fraud_scenario_id": (
+                        scenario_id
+                    ),
+                }
+            )
+
+            current_balance = balance_after
+
+    return _combine_baseline_and_fraud(
+        baseline=baseline,
+        fraudulent_rows=fraudulent_rows,
+    )
 
 def _validate_parameters(
     n_scenarios: int,
