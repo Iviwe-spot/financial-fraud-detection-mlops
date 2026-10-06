@@ -11,14 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.generator.fraud_injector import (
+    FRAUD_TYPE_ABNORMAL_AMOUNT,
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
     FRAUD_TYPE_CARD_TESTING,
     FRAUD_TYPE_VELOCITY_ATTACK,
+    inject_abnormal_amount,
     inject_account_takeover,
     inject_card_testing,
     inject_velocity_attack,
 )
-
 
 RAW_DIR = ROOT / "data" / "raw"
 PROCESSED_DIR = ROOT / "data" / "processed"
@@ -35,6 +36,7 @@ EXPECTED_FRAUD_TYPES = {
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
     FRAUD_TYPE_CARD_TESTING,
     FRAUD_TYPE_VELOCITY_ATTACK,
+    FRAUD_TYPE_ABNORMAL_AMOUNT,
 }
 
 
@@ -78,12 +80,12 @@ def inject_fraud_scenarios(
     accounts: pd.DataFrame,
     customers: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Apply the three fraud typologies sequentially."""
+    """Apply all fraud typologies sequentially."""
     output = inject_account_takeover(
         transactions=transactions,
         accounts=accounts,
         customers=customers,
-        n_scenarios=30,
+        n_scenarios=25,
         min_transactions=2,
         max_transactions=5,
         seed=42,
@@ -93,7 +95,7 @@ def inject_fraud_scenarios(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=25,
+        n_scenarios=20,
         min_transactions=5,
         max_transactions=12,
         seed=43,
@@ -103,14 +105,23 @@ def inject_fraud_scenarios(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=25,
+        n_scenarios=20,
         min_transactions=5,
         max_transactions=10,
         seed=44,
     )
 
-    return output
+    output = inject_abnormal_amount(
+        transactions=output,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=100,
+        min_zscore=4.0,
+        max_zscore=8.0,
+        seed=45,
+    )
 
+    return output
 
 def validate_output(
     baseline: pd.DataFrame,
@@ -430,6 +441,11 @@ def main() -> None:
         fraud=fraud,
         fraud_type=FRAUD_TYPE_VELOCITY_ATTACK,
         heading="Velocity Attack",
+    )
+    print_examples(
+        fraud=fraud,
+        fraud_type=FRAUD_TYPE_ABNORMAL_AMOUNT,
+        heading="Abnormal Amount",
     )
 
     save_output(

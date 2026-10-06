@@ -2,9 +2,11 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from src.generator.fraud_injector import (
+    FRAUD_TYPE_ABNORMAL_AMOUNT,
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
     FRAUD_TYPE_CARD_TESTING,
     FRAUD_TYPE_VELOCITY_ATTACK,
+    inject_abnormal_amount,
     inject_account_takeover,
     inject_card_testing,
     inject_velocity_attack,
@@ -635,6 +637,207 @@ def test_velocity_attack_is_reproducible():
         customers,
         n_scenarios=1,
         seed=44,
+    )
+
+    assert_frame_equal(first, second)
+
+def test_abnormal_amount_adds_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ABNORMAL_AMOUNT
+    ]
+
+    assert len(fraud) == 1
+    assert (fraud["is_fraud"] == 1).all()
+
+
+def test_abnormal_amount_is_customer_relative():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        min_zscore=4.0,
+        max_zscore=8.0,
+        seed=45,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ABNORMAL_AMOUNT
+    ].iloc[0]
+
+    customer = customers[
+        customers["customer_id"]
+        == fraud["customer_id"]
+    ].iloc[0]
+
+    zscore = (
+        fraud["amount"]
+        - customer["avg_transaction"]
+    ) / customer["std_transaction"]
+
+    assert zscore >= 4.0
+
+
+def test_abnormal_amount_is_single_transaction_scenario():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ABNORMAL_AMOUNT
+    ]
+
+    scenario_sizes = (
+        fraud
+        .groupby("fraud_scenario_id")
+        .size()
+    )
+
+    assert (scenario_sizes == 1).all()
+
+
+def test_abnormal_amount_reuses_known_device():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ABNORMAL_AMOUNT
+    ].iloc[0]
+
+    known_devices = set(
+        transactions.loc[
+            transactions["customer_id"]
+            == fraud["customer_id"],
+            "device_id",
+        ]
+    )
+
+    assert fraud["device_id"] in known_devices
+
+
+def test_abnormal_amount_preserves_existing_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    with_ato = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    ato_count_before = (
+        with_ato["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ).sum()
+
+    combined = inject_abnormal_amount(
+        with_ato,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    ato_count_after = (
+        combined["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ).sum()
+
+    assert ato_count_after == ato_count_before
+
+    assert (
+        combined["fraud_type"]
+        == FRAUD_TYPE_ABNORMAL_AMOUNT
+    ).any()
+
+
+def test_abnormal_amount_excludes_compromised_account():
+    customers, accounts, transactions = _sample_data()
+
+    with_ato = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    compromised_accounts = set(
+        with_ato.loc[
+            with_ato["fraud_type"]
+            == FRAUD_TYPE_ACCOUNT_TAKEOVER,
+            "account_id",
+        ]
+    )
+
+    combined = inject_abnormal_amount(
+        with_ato,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    abnormal_accounts = set(
+        combined.loc[
+            combined["fraud_type"]
+            == FRAUD_TYPE_ABNORMAL_AMOUNT,
+            "account_id",
+        ]
+    )
+
+    assert compromised_accounts.isdisjoint(
+        abnormal_accounts
+    )
+
+
+def test_abnormal_amount_is_reproducible():
+    customers, accounts, transactions = _sample_data()
+
+    first = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
+    )
+
+    second = inject_abnormal_amount(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=45,
     )
 
     assert_frame_equal(first, second)

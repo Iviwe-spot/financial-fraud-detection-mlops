@@ -7,6 +7,7 @@ import pandas as pd
 FRAUD_TYPE_ACCOUNT_TAKEOVER = "ACCOUNT_TAKEOVER"
 FRAUD_TYPE_CARD_TESTING = "CARD_TESTING"
 FRAUD_TYPE_VELOCITY_ATTACK = "VELOCITY_ATTACK"
+FRAUD_TYPE_ABNORMAL_AMOUNT = "ABNORMAL_AMOUNT"
 
 CARD_TESTING_MIN_AMOUNT = 1.00
 CARD_TESTING_MAX_AMOUNT = 20.00
@@ -1015,6 +1016,366 @@ def inject_velocity_attack(
             )
 
             current_balance = balance_after
+
+    return _combine_baseline_and_fraud(
+        baseline=baseline,
+        fraudulent_rows=fraudulent_rows,
+    )
+def inject_abnormal_amount(
+    transactions: pd.DataFrame,
+    accounts: pd.DataFrame,
+    customers: pd.DataFrame,
+    n_scenarios: int = 45,
+    min_zscore: float = 4.0,
+    max_zscore: float = 8.0,
+    seed: int = 45,
+) -> pd.DataFrame:
+    """
+    Inject synthetic Abnormal Amount fraud.
+
+    Each scenario contains one transaction whose amount is extreme
+    relative to the customer's normal transaction behaviour.
+
+    The scenario deliberately avoids relying on new devices,
+    unusual locations, or transaction bursts. Its primary signal
+    is customer-relative transaction amount.
+
+    Accounts already involved in an existing fraud scenario are
+    excluded to prevent overlapping fraud typologies.
+
+    Existing fraud labels are preserved.
+    """
+
+    if n_scenarios <= 0:
+        raise ValueError(
+            "n_scenarios must be greater than zero"
+        )
+
+    if min_zscore <= 0:
+        raise ValueError(
+            "min_zscore must be greater than zero"
+        )
+
+    if max_zscore < min_zscore:
+        raise ValueError(
+            "max_zscore must be greater than or "
+            "equal to min_zscore"
+        )
+
+    _validate_transaction_columns(transactions)
+
+    rng = np.random.default_rng(seed)
+
+    baseline = transactions.copy(deep=True)
+    account_master = accounts.copy(deep=True)
+    customer_master = customers.copy(deep=True)
+
+    if "is_fraud" not in baseline.columns:
+        baseline["is_fraud"] = 0
+
+    if "fraud_type" not in baseline.columns:
+        baseline["fraud_type"] = None
+
+    if "fraud_scenario_id" not in baseline.columns:
+        baseline["fraud_scenario_id"] = None
+
+    legitimate = baseline[
+        baseline["is_fraud"] == 0
+    ].copy()
+
+    # Prevent different fraud typologies from being injected
+    # independently into the same account.
+    compromised_accounts = set(
+        baseline.loc[
+            baseline["is_fraud"] == 1,
+            "account_id",
+        ]
+    )
+
+    eligible_accounts = _get_eligible_accounts(
+        baseline=legitimate,
+        accounts=account_master,
+    )
+
+    eligible_accounts = eligible_accounts[
+        ~eligible_accounts["account_id"].isin(
+            compromised_accounts
+        )
+    ].copy()
+
+    latest_balances = (
+        legitimate
+        .sort_values("timestamp")
+        .groupby("account_id", as_index=False)
+        .tail(1)[
+            [
+                "account_id",
+                "balance_after",
+            ]
+        ]
+        .rename(
+            columns={
+                "balance_after": "latest_balance"
+            }
+        )
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        latest_balances,
+        on="account_id",
+        how="inner",
+    )
+
+    # A meaningful abnormal-amount transaction requires
+    # sufficient available balance.
+    eligible_accounts = eligible_accounts[
+        eligible_accounts["latest_balance"] > 100.0
+    ].copy()
+
+    if n_scenarios > len(eligible_accounts):
+        raise ValueError(
+            "n_scenarios cannot exceed the number of "
+            "eligible uncompromised active accounts"
+        )
+
+    victim_indices = rng.choice(
+        eligible_accounts.index.to_numpy(),
+        size=n_scenarios,
+        replace=False,
+    )
+
+    victims = (
+        eligible_accounts
+        .loc[victim_indices]
+        .reset_index(drop=True)
+    )
+
+    fraudulent_rows: list[dict] = []
+
+    global_max_timestamp = pd.to_datetime(
+        legitimate["timestamp"]
+    ).max()
+
+    for scenario_number, victim in victims.iterrows():
+        account_id = victim["account_id"]
+        customer_id = victim["customer_id"]
+
+        customer_rows = customer_master[
+            customer_master["customer_id"]
+            == customer_id
+        ]
+
+        if customer_rows.empty:
+            continue
+
+        customer = customer_rows.iloc[0]
+
+        customer_history = legitimate[
+            legitimate["customer_id"]
+            == customer_id
+        ].sort_values("timestamp")
+
+        account_history = customer_history[
+            customer_history["account_id"]
+            == account_id
+        ].sort_values("timestamp")
+
+        if customer_history.empty or account_history.empty:
+            continue
+
+        customer_average = max(
+            float(customer["avg_transaction"]),
+            1.0,
+        )
+
+        customer_std = max(
+            float(customer["std_transaction"]),
+            1.0,
+        )
+
+        current_balance = float(
+            account_history.iloc[-1][
+                "balance_after"
+            ]
+        )
+
+        # Select a customer-relative anomaly severity.
+        target_zscore = float(
+            rng.uniform(
+                min_zscore,
+                max_zscore,
+            )
+        )
+
+        proposed_amount = (
+            customer_average
+            + target_zscore * customer_std
+        )
+
+        # Skip victims whose balance cannot support at least
+        # the minimum requested customer-relative anomaly.
+        minimum_abnormal_amount = (
+            customer_average
+            + min_zscore * customer_std
+        )
+
+        if current_balance < minimum_abnormal_amount:
+            continue
+
+        amount = min(
+            proposed_amount,
+            current_balance,
+        )
+
+        amount = round(
+            max(float(amount), 0.01),
+            2,
+        )
+
+        last_timestamp = pd.Timestamp(
+            account_history["timestamp"].max()
+        )
+
+        fraud_timestamp = (
+            last_timestamp
+            + pd.Timedelta(
+                hours=int(rng.integers(1, 25))
+            )
+        )
+
+        if fraud_timestamp > global_max_timestamp:
+            fraud_timestamp = (
+                global_max_timestamp
+                - pd.Timedelta(
+                    hours=int(
+                        rng.integers(0, 12)
+                    )
+                )
+            )
+
+        # Keep the transaction inside the customer's usual
+        # activity window where possible.
+        usual_start = int(
+            customer["usual_start_hour"]
+        )
+
+        usual_end = int(
+            customer["usual_end_hour"]
+        )
+
+        if usual_start <= usual_end:
+            normal_hour = int(
+                rng.integers(
+                    usual_start,
+                    usual_end + 1,
+                )
+            )
+        else:
+            normal_hours = list(
+                range(usual_start, 24)
+            ) + list(
+                range(0, usual_end + 1)
+            )
+
+            normal_hour = int(
+                rng.choice(normal_hours)
+            )
+
+        fraud_timestamp = fraud_timestamp.replace(
+            hour=normal_hour,
+            minute=int(rng.integers(0, 60)),
+            second=int(rng.integers(0, 60)),
+        )
+
+        # Reuse a legitimate device so the primary signal
+        # remains the amount anomaly.
+        known_devices = (
+            customer_history["device_id"]
+            .dropna()
+            .unique()
+        )
+
+        if len(known_devices) > 0:
+            device_id = str(
+                rng.choice(known_devices)
+            )
+        else:
+            device_id = (
+                f"ABNORMAL_AMOUNT_DEVICE_"
+                f"{scenario_number + 1:06d}"
+            )
+
+        # Reuse plausible legitimate transaction metadata
+        # rather than creating a fraud-specific merchant.
+        reference_transaction = (
+            customer_history.iloc[
+                int(
+                    rng.integers(
+                        0,
+                        len(customer_history),
+                    )
+                )
+            ]
+        )
+
+        balance_before = round(
+            current_balance,
+            2,
+        )
+
+        balance_after = round(
+            max(
+                balance_before - amount,
+                0.0,
+            ),
+            2,
+        )
+
+        scenario_id = (
+            f"ABNORMAL_AMOUNT_"
+            f"{scenario_number + 1:06d}"
+        )
+
+        fraudulent_rows.append(
+            {
+                "transaction_id": (
+                    f"FRAUD_ABNORMAL_AMOUNT_"
+                    f"{scenario_number + 1:06d}"
+                ),
+                "account_id": account_id,
+                "customer_id": customer_id,
+                "timestamp": fraud_timestamp,
+                "amount": amount,
+                "merchant": reference_transaction[
+                    "merchant"
+                ],
+                "merchant_category": (
+                    reference_transaction[
+                        "merchant_category"
+                    ]
+                ),
+                "transaction_type": (
+                    reference_transaction[
+                        "transaction_type"
+                    ]
+                ),
+                "channel": reference_transaction[
+                    "channel"
+                ],
+                "device_id": device_id,
+                "province": customer["province"],
+                "country": "South Africa",
+                "is_international": False,
+                "direction": "DEBIT",
+                "balance_before": balance_before,
+                "balance_after": balance_after,
+                "is_fraud": 1,
+                "fraud_type": (
+                    FRAUD_TYPE_ABNORMAL_AMOUNT
+                ),
+                "fraud_scenario_id": scenario_id,
+            }
+        )
 
     return _combine_baseline_and_fraud(
         baseline=baseline,
