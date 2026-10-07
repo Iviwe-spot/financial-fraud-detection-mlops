@@ -9,6 +9,7 @@ FRAUD_TYPE_CARD_TESTING = "CARD_TESTING"
 FRAUD_TYPE_VELOCITY_ATTACK = "VELOCITY_ATTACK"
 FRAUD_TYPE_ABNORMAL_AMOUNT = "ABNORMAL_AMOUNT"
 FRAUD_TYPE_GEOGRAPHIC_ANOMALY = "GEOGRAPHIC_ANOMALY"
+FRAUD_TYPE_BALANCE_DRAINING = "BALANCE_DRAINING"
 
 CARD_TESTING_MIN_AMOUNT = 1.00
 CARD_TESTING_MAX_AMOUNT = 20.00
@@ -1855,6 +1856,440 @@ def inject_geographic_anomaly(
                 "fraud_scenario_id": scenario_id,
             }
         )
+
+    return _combine_baseline_and_fraud(
+        baseline=baseline,
+        fraudulent_rows=fraudulent_rows,
+    )
+
+def inject_balance_draining(
+    transactions: pd.DataFrame,
+    accounts: pd.DataFrame,
+    customers: pd.DataFrame,
+    n_scenarios: int = 25,
+    min_transactions: int = 4,
+    max_transactions: int = 8,
+    min_drain_fraction: float = 0.70,
+    max_drain_fraction: float = 0.95,
+    min_gap_seconds: int = 30,
+    max_gap_seconds: int = 180,
+    seed: int = 47,
+) -> pd.DataFrame:
+    """
+    Inject synthetic Balance Draining fraud.
+
+    Each scenario creates a short sequence of fraudulent debit
+    transactions that progressively removes a large proportion of
+    the account's available balance.
+
+    The scenario reuses a known device and familiar domestic location.
+    Its primary signal is cumulative balance depletion rather than a
+    new device, unusual geography, or a single abnormal transaction.
+
+    Accounts already involved in existing fraud scenarios are excluded.
+    Existing fraud labels are preserved.
+    """
+
+    if n_scenarios <= 0:
+        raise ValueError(
+            "n_scenarios must be greater than zero"
+        )
+
+    if min_transactions <= 0:
+        raise ValueError(
+            "min_transactions must be greater than zero"
+        )
+
+    if max_transactions < min_transactions:
+        raise ValueError(
+            "max_transactions must be greater than or "
+            "equal to min_transactions"
+        )
+
+    if not 0 < min_drain_fraction < 1:
+        raise ValueError(
+            "min_drain_fraction must be between zero and one"
+        )
+
+    if not 0 < max_drain_fraction < 1:
+        raise ValueError(
+            "max_drain_fraction must be between zero and one"
+        )
+
+    if max_drain_fraction < min_drain_fraction:
+        raise ValueError(
+            "max_drain_fraction must be greater than or "
+            "equal to min_drain_fraction"
+        )
+
+    if min_gap_seconds <= 0:
+        raise ValueError(
+            "min_gap_seconds must be greater than zero"
+        )
+
+    if max_gap_seconds < min_gap_seconds:
+        raise ValueError(
+            "max_gap_seconds must be greater than or "
+            "equal to min_gap_seconds"
+        )
+
+    _validate_transaction_columns(transactions)
+
+    rng = np.random.default_rng(seed)
+
+    baseline = transactions.copy(deep=True)
+    account_master = accounts.copy(deep=True)
+    customer_master = customers.copy(deep=True)
+
+    if "is_fraud" not in baseline.columns:
+        baseline["is_fraud"] = 0
+
+    if "fraud_type" not in baseline.columns:
+        baseline["fraud_type"] = None
+
+    if "fraud_scenario_id" not in baseline.columns:
+        baseline["fraud_scenario_id"] = None
+
+    legitimate = baseline[
+        baseline["is_fraud"] == 0
+    ].copy()
+
+    legitimate["timestamp"] = pd.to_datetime(
+        legitimate["timestamp"]
+    )
+
+    compromised_accounts = set(
+        baseline.loc[
+            baseline["is_fraud"] == 1,
+            "account_id",
+        ]
+    )
+
+    eligible_accounts = _get_eligible_accounts(
+        baseline=legitimate,
+        accounts=account_master,
+    )
+
+    eligible_accounts = eligible_accounts[
+        ~eligible_accounts["account_id"].isin(
+            compromised_accounts
+        )
+    ].copy()
+
+    latest_account_state = (
+        legitimate
+        .sort_values("timestamp")
+        .groupby(
+            "account_id",
+            as_index=False,
+        )
+        .tail(1)[
+            [
+                "account_id",
+                "timestamp",
+                "balance_after",
+            ]
+        ]
+        .rename(
+            columns={
+                "timestamp": "latest_timestamp",
+                "balance_after": "latest_balance",
+            }
+        )
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        latest_account_state,
+        on="account_id",
+        how="inner",
+    )
+
+    eligible_accounts = eligible_accounts[
+        eligible_accounts["latest_balance"] >= 100.0
+    ].copy()
+
+    if n_scenarios > len(eligible_accounts):
+        raise ValueError(
+            "n_scenarios cannot exceed the number of "
+            "eligible uncompromised active accounts with "
+            "sufficient available balance"
+        )
+
+    victim_indices = rng.choice(
+        eligible_accounts.index.to_numpy(),
+        size=n_scenarios,
+        replace=False,
+    )
+
+    victims = (
+        eligible_accounts
+        .loc[victim_indices]
+        .reset_index(drop=True)
+    )
+
+    fraudulent_rows: list[dict] = []
+
+    for scenario_number, victim in victims.iterrows():
+        account_id = victim["account_id"]
+        customer_id = victim["customer_id"]
+
+        customer_rows = customer_master[
+            customer_master["customer_id"]
+            == customer_id
+        ]
+
+        if customer_rows.empty:
+            continue
+
+        customer = customer_rows.iloc[0]
+
+        customer_history = legitimate[
+            legitimate["customer_id"]
+            == customer_id
+        ].sort_values("timestamp")
+
+        account_history = legitimate[
+            legitimate["account_id"]
+            == account_id
+        ].sort_values("timestamp")
+
+        if (
+            customer_history.empty
+            or account_history.empty
+        ):
+            continue
+
+        starting_balance = round(
+            float(
+                account_history.iloc[-1][
+                    "balance_after"
+                ]
+            ),
+            2,
+        )
+
+        if starting_balance < 100.0:
+            continue
+
+        transaction_count = int(
+            rng.integers(
+                min_transactions,
+                max_transactions + 1,
+            )
+        )
+
+        drain_fraction = float(
+            rng.uniform(
+                min_drain_fraction,
+                max_drain_fraction,
+            )
+        )
+
+        target_drain_cents = int(
+            round(
+                starting_balance
+                * drain_fraction
+                * 100
+            )
+        )
+
+        maximum_available_cents = int(
+            round(
+                starting_balance
+                * 100
+            )
+        )
+
+        target_drain_cents = min(
+            target_drain_cents,
+            maximum_available_cents,
+        )
+
+        if target_drain_cents < transaction_count:
+            continue
+
+        weights = rng.uniform(
+            0.80,
+            1.20,
+            size=transaction_count,
+        )
+
+        weights = weights / weights.sum()
+
+        amount_cents = np.floor(
+            weights * target_drain_cents
+        ).astype(int)
+
+        amount_cents = np.maximum(
+            amount_cents,
+            1,
+        )
+
+        rounding_difference = (
+            target_drain_cents
+            - int(amount_cents.sum())
+        )
+
+        amount_cents[-1] += rounding_difference
+
+        if amount_cents[-1] <= 0:
+            continue
+
+        known_devices = (
+            customer_history["device_id"]
+            .dropna()
+            .unique()
+        )
+
+        if len(known_devices) > 0:
+            device_id = str(
+                rng.choice(known_devices)
+            )
+        else:
+            device_id = (
+                f"DRAIN_DEVICE_"
+                f"{scenario_number + 1:06d}"
+            )
+
+        domestic_history = customer_history[
+            (
+                customer_history["country"]
+                == "South Africa"
+            )
+            & (
+                customer_history["province"].notna()
+            )
+            & (
+                customer_history["province"]
+                != "INTERNATIONAL"
+            )
+        ].sort_values("timestamp")
+
+        if not domestic_history.empty:
+            reference_transaction = (
+                domestic_history.iloc[-1]
+            )
+            province = str(
+                reference_transaction["province"]
+            )
+        else:
+            reference_transaction = (
+                customer_history.iloc[-1]
+            )
+            province = str(
+                customer["province"]
+            )
+
+        latest_timestamp = pd.Timestamp(
+            account_history.iloc[-1][
+                "timestamp"
+            ]
+        )
+
+        first_delay_minutes = int(
+            rng.integers(5, 61)
+        )
+
+        current_timestamp = (
+            latest_timestamp
+            + pd.Timedelta(
+                minutes=first_delay_minutes
+            )
+        )
+
+        current_balance_cents = int(
+            round(
+                starting_balance * 100
+            )
+        )
+
+        scenario_id = (
+            f"DRAIN_"
+            f"{scenario_number + 1:06d}"
+        )
+
+        for transaction_number in range(
+            transaction_count
+        ):
+            if transaction_number > 0:
+                gap_seconds = int(
+                    rng.integers(
+                        min_gap_seconds,
+                        max_gap_seconds + 1,
+                    )
+                )
+
+                current_timestamp = (
+                    current_timestamp
+                    + pd.Timedelta(
+                        seconds=gap_seconds
+                    )
+                )
+
+            transaction_amount_cents = int(
+                amount_cents[
+                    transaction_number
+                ]
+            )
+
+            transaction_amount_cents = min(
+                transaction_amount_cents,
+                current_balance_cents,
+            )
+
+            if transaction_amount_cents <= 0:
+                continue
+
+            balance_before = round(
+                current_balance_cents / 100,
+                2,
+            )
+
+            current_balance_cents -= (
+                transaction_amount_cents
+            )
+
+            balance_after = round(
+                current_balance_cents / 100,
+                2,
+            )
+
+            amount = round(
+                transaction_amount_cents / 100,
+                2,
+            )
+
+            fraudulent_rows.append(
+                {
+                    "transaction_id": (
+                        f"FRAUD_DRAIN_"
+                        f"{scenario_number + 1:06d}_"
+                        f"{transaction_number + 1:02d}"
+                    ),
+                    "account_id": account_id,
+                    "customer_id": customer_id,
+                    "timestamp": current_timestamp,
+                    "amount": amount,
+                    "merchant": "BANK_TRANSFER",
+                    "merchant_category": (
+                        "MONEY_TRANSFER"
+                    ),
+                    "transaction_type": "TRANSFER",
+                    "channel": "ONLINE",
+                    "device_id": device_id,
+                    "province": province,
+                    "country": "South Africa",
+                    "is_international": False,
+                    "direction": "DEBIT",
+                    "balance_before": balance_before,
+                    "balance_after": balance_after,
+                    "is_fraud": 1,
+                    "fraud_type": (
+                        FRAUD_TYPE_BALANCE_DRAINING
+                    ),
+                    "fraud_scenario_id": scenario_id,
+                }
+            )
 
     return _combine_baseline_and_fraud(
         baseline=baseline,

@@ -18,6 +18,8 @@ from src.generator.fraud_injector import (
     FRAUD_TYPE_CARD_TESTING,
     FRAUD_TYPE_GEOGRAPHIC_ANOMALY,
     FRAUD_TYPE_VELOCITY_ATTACK,
+    FRAUD_TYPE_BALANCE_DRAINING,
+    inject_balance_draining,
     inject_abnormal_amount,
     inject_account_takeover,
     inject_card_testing,
@@ -51,6 +53,7 @@ EXPECTED_FRAUD_TYPES = {
     FRAUD_TYPE_VELOCITY_ATTACK,
     FRAUD_TYPE_ABNORMAL_AMOUNT,
     FRAUD_TYPE_GEOGRAPHIC_ANOMALY,
+    FRAUD_TYPE_BALANCE_DRAINING,
 }
 
 
@@ -111,74 +114,68 @@ def inject_fraud_scenarios(
 ) -> pd.DataFrame:
     """Apply all fraud typologies sequentially."""
 
-    # ---------------------------------------------------------
-    # 1. Account Takeover
-    # ---------------------------------------------------------
-
     output = inject_account_takeover(
         transactions=transactions,
         accounts=accounts,
         customers=customers,
-        n_scenarios=25,
+        n_scenarios=20,
         min_transactions=2,
         max_transactions=5,
         seed=42,
     )
 
-    # ---------------------------------------------------------
-    # 2. Card Testing
-    # ---------------------------------------------------------
-
     output = inject_card_testing(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=20,
+        n_scenarios=15,
         min_transactions=5,
         max_transactions=12,
         seed=43,
     )
 
-    # ---------------------------------------------------------
-    # 3. Velocity Attack
-    # ---------------------------------------------------------
-
     output = inject_velocity_attack(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=20,
+        n_scenarios=15,
         min_transactions=5,
         max_transactions=10,
         seed=44,
     )
 
-    # ---------------------------------------------------------
-    # 4. Abnormal Amount
-    # ---------------------------------------------------------
-
     output = inject_abnormal_amount(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=60,
+        n_scenarios=50,
         min_zscore=4.0,
         max_zscore=8.0,
         seed=45,
     )
 
-    # ---------------------------------------------------------
-    # 5. Geographic Anomaly / Impossible Travel
-    # ---------------------------------------------------------
-
     output = inject_geographic_anomaly(
         transactions=output,
         accounts=accounts,
         customers=customers,
-        n_scenarios=40,
+        n_scenarios=35,
         min_minutes_after_previous=5,
         max_minutes_after_previous=45,
         seed=46,
+    )
+
+    output = inject_balance_draining(
+        transactions=output,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=18,
+        min_transactions=4,
+        max_transactions=8,
+        min_drain_fraction=0.70,
+        max_drain_fraction=0.95,
+        min_gap_seconds=30,
+        max_gap_seconds=180,
+        seed=47,
     )
 
     return output
@@ -521,27 +518,29 @@ def print_examples(
         "customer_id",
         "timestamp",
         "amount",
-        "device_id",
-        "fraud_scenario_id",
     ]
 
-    # Geographic anomaly examples benefit
-    # from displaying their province.
-    if (
-        fraud_type
-        == FRAUD_TYPE_GEOGRAPHIC_ANOMALY
-    ):
-        columns.insert(
-            4,
-            "province",
+    if fraud_type == FRAUD_TYPE_GEOGRAPHIC_ANOMALY:
+        columns.append("province")
+
+    columns.extend(
+        [
+            "device_id",
+            "fraud_scenario_id",
+        ]
+    )
+
+    if fraud_type == FRAUD_TYPE_BALANCE_DRAINING:
+        columns.extend(
+            [
+                "balance_before",
+                "balance_after",
+            ]
         )
 
     examples = (
         fraud.loc[
-            fraud[
-                "fraud_type"
-            ]
-            == fraud_type,
+            fraud["fraud_type"] == fraud_type,
             columns,
         ]
         .sort_values(
@@ -553,16 +552,8 @@ def print_examples(
         .head(5)
     )
 
-    print(
-        f"\nExample {heading} records:"
-    )
-
-    print(
-        examples.to_string(
-            index=False
-        )
-    )
-
+    print(f"\nExample {heading} records:")
+    print(examples.to_string(index=False))
 
 def validate_geographic_anomalies(
     baseline: pd.DataFrame,
@@ -1112,6 +1103,11 @@ def main() -> None:
 
     print_geographic_validation(
         geographic_validation
+    )
+    print_examples(
+        fraud=fraud,
+        fraud_type=FRAUD_TYPE_BALANCE_DRAINING,
+        heading="Balance Draining",
     )
 
     # ---------------------------------------------------------

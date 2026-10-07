@@ -4,14 +4,16 @@ from pandas.testing import assert_frame_equal
 from src.generator.fraud_injector import (
     FRAUD_TYPE_ABNORMAL_AMOUNT,
     FRAUD_TYPE_ACCOUNT_TAKEOVER,
+    FRAUD_TYPE_BALANCE_DRAINING,
     FRAUD_TYPE_CARD_TESTING,
-    FRAUD_TYPE_VELOCITY_ATTACK,
     FRAUD_TYPE_GEOGRAPHIC_ANOMALY,
+    FRAUD_TYPE_VELOCITY_ATTACK,
     inject_abnormal_amount,
     inject_account_takeover,
+    inject_balance_draining,
     inject_card_testing,
-    inject_velocity_attack,
     inject_geographic_anomaly,
+    inject_velocity_attack,
 )
 
 
@@ -1048,3 +1050,255 @@ def test_geographic_anomaly_is_reproducible():
     )
 
     assert_frame_equal(first, second)
+
+def test_balance_draining_adds_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=4,
+        max_transactions=4,
+        seed=47,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_BALANCE_DRAINING
+    ]
+
+    assert len(fraud) == 4
+    assert fraud["is_fraud"].eq(1).all()
+    assert fraud["fraud_scenario_id"].nunique() == 1
+
+
+def test_balance_draining_reduces_balance_progressively():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=5,
+        max_transactions=5,
+        seed=47,
+    )
+
+    fraud = (
+        result[
+            result["fraud_type"]
+            == FRAUD_TYPE_BALANCE_DRAINING
+        ]
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    assert len(fraud) == 5
+    assert (
+        fraud["balance_after"]
+        < fraud["balance_before"]
+    ).all()
+
+    assert fraud["balance_after"].is_monotonic_decreasing
+
+    for position in range(1, len(fraud)):
+        assert (
+            fraud.loc[
+                position,
+                "balance_before",
+            ]
+            == fraud.loc[
+                position - 1,
+                "balance_after",
+            ]
+        )
+
+
+def test_balance_draining_removes_target_balance_fraction():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=4,
+        max_transactions=4,
+        min_drain_fraction=0.80,
+        max_drain_fraction=0.80,
+        seed=47,
+    )
+
+    fraud = (
+        result[
+            result["fraud_type"]
+            == FRAUD_TYPE_BALANCE_DRAINING
+        ]
+        .sort_values("timestamp")
+    )
+
+    starting_balance = float(
+        fraud.iloc[0]["balance_before"]
+    )
+
+    ending_balance = float(
+        fraud.iloc[-1]["balance_after"]
+    )
+
+    drained_fraction = (
+        starting_balance - ending_balance
+    ) / starting_balance
+
+    assert abs(drained_fraction - 0.80) < 0.001
+    assert ending_balance >= 0
+
+
+def test_balance_draining_reuses_known_device():
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=4,
+        max_transactions=4,
+        seed=47,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_BALANCE_DRAINING
+    ]
+
+    known_devices = set(
+        transactions["device_id"]
+    )
+
+    assert set(
+        fraud["device_id"]
+    ).issubset(known_devices)
+
+    assert fraud["device_id"].nunique() == 1
+
+
+def test_balance_draining_preserves_existing_fraud():
+    customers, accounts, transactions = _sample_data()
+
+    with_takeover = inject_account_takeover(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=2,
+        max_transactions=2,
+        seed=42,
+    )
+
+    previous_fraud_count = int(
+        with_takeover["is_fraud"].sum()
+    )
+
+    result = inject_balance_draining(
+        transactions=with_takeover,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=4,
+        max_transactions=4,
+        seed=47,
+    )
+
+    assert (
+        result[
+            "is_fraud"
+        ].sum()
+        == previous_fraud_count + 4
+    )
+
+    assert (
+        result[
+            "fraud_type"
+        ]
+        .eq(
+            FRAUD_TYPE_ACCOUNT_TAKEOVER
+        )
+        .sum()
+        == previous_fraud_count
+    )
+
+
+def test_balance_draining_excludes_compromised_account():
+    customers, accounts, transactions = _sample_data()
+
+    with_takeover = inject_account_takeover(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=2,
+        max_transactions=2,
+        seed=42,
+    )
+
+    compromised_accounts = set(
+        with_takeover.loc[
+            with_takeover["is_fraud"] == 1,
+            "account_id",
+        ]
+    )
+
+    result = inject_balance_draining(
+        transactions=with_takeover,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=1,
+        min_transactions=4,
+        max_transactions=4,
+        seed=47,
+    )
+
+    draining_accounts = set(
+        result.loc[
+            result["fraud_type"]
+            == FRAUD_TYPE_BALANCE_DRAINING,
+            "account_id",
+        ]
+    )
+
+    assert draining_accounts
+    assert draining_accounts.isdisjoint(
+        compromised_accounts
+    )
+
+
+def test_balance_draining_is_reproducible():
+    customers, accounts, transactions = _sample_data()
+
+    first = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=2,
+        min_transactions=4,
+        max_transactions=6,
+        seed=47,
+    )
+
+    second = inject_balance_draining(
+        transactions=transactions,
+        accounts=accounts,
+        customers=customers,
+        n_scenarios=2,
+        min_transactions=4,
+        max_transactions=6,
+        seed=47,
+    )
+
+    assert_frame_equal(
+        first.reset_index(drop=True),
+        second.reset_index(drop=True),
+    )
