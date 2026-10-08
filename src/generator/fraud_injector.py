@@ -1289,10 +1289,23 @@ def inject_abnormal_amount(
             second=int(rng.integers(0, 60)),
         )
 
-        # Reuse a legitimate device so the primary signal
-        # remains the amount anomaly.
+        # Restrict behavioural context to legitimate history
+        # available before the fraud transaction. This prevents
+        # point-in-time leakage from future customer activity.
+        prior_customer_history = customer_history[
+            customer_history["timestamp"]
+            < fraud_timestamp
+        ].copy()
+
+        # A valid abnormal-amount scenario requires prior
+        # legitimate customer history at the fraud timestamp.
+        if prior_customer_history.empty:
+            continue
+
+        # Reuse a device already known at the fraud timestamp
+        # so the primary fraud signal remains the amount anomaly.
         known_devices = (
-            customer_history["device_id"]
+            prior_customer_history["device_id"]
             .dropna()
             .unique()
         )
@@ -1307,14 +1320,16 @@ def inject_abnormal_amount(
                 f"{scenario_number + 1:06d}"
             )
 
-        # Reuse plausible legitimate transaction metadata
-        # rather than creating a fraud-specific merchant.
+        # Reuse plausible legitimate transaction metadata only
+        # from customer activity available before the fraud
+        # timestamp. This prevents future-information leakage
+        # through merchant, category, type, or channel.
         reference_transaction = (
-            customer_history.iloc[
+            prior_customer_history.iloc[
                 int(
                     rng.integers(
                         0,
-                        len(customer_history),
+                        len(prior_customer_history),
                     )
                 )
             ]
