@@ -225,11 +225,12 @@ def test_fraud_has_correct_ground_truth():
 
 
 def test_fraud_uses_new_device():
+    """
+    Account Takeover must use a device that exists in the
+    legitimate population but was not previously used by the
+    victim customer.
+    """
     customers, accounts, transactions = _sample_data()
-
-    original_devices = set(
-        transactions["device_id"]
-    )
 
     result = inject_account_takeover(
         transactions,
@@ -239,16 +240,59 @@ def test_fraud_uses_new_device():
         seed=42,
     )
 
-    fraud_devices = set(
-        result.loc[
-            result["is_fraud"] == 1,
-            "device_id",
-        ]
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ].copy()
+
+    assert not fraud.empty
+
+    legitimate_devices = set(
+        transactions["device_id"]
+        .dropna()
+        .astype(str)
     )
 
-    assert fraud_devices.isdisjoint(
-        original_devices
+    fraud_devices = set(
+        fraud["device_id"]
+        .dropna()
+        .astype(str)
     )
+
+    # The attacker device must come from the legitimate
+    # population rather than being a fraud-only identifier.
+    assert fraud_devices.issubset(
+        legitimate_devices
+    )
+
+    for scenario_id, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        customer_id = scenario["customer_id"].iloc[0]
+        fraud_start = pd.to_datetime(
+            scenario["timestamp"]
+        ).min()
+        fraud_device = str(
+            scenario["device_id"].iloc[0]
+        )
+
+        prior_history = transactions[
+            (transactions["customer_id"] == customer_id)
+            & (
+                pd.to_datetime(
+                    transactions["timestamp"]
+                )
+                < fraud_start
+            )
+        ]
+
+        prior_devices = set(
+            prior_history["device_id"]
+            .dropna()
+            .astype(str)
+        )
+
+        assert fraud_device not in prior_devices
 
 
 def test_foreign_keys_remain_valid():
@@ -427,11 +471,11 @@ def test_card_testing_creates_transaction_burst():
 
 
 def test_card_testing_uses_new_device():
+    """
+    Card Testing must use a legitimate-population device that
+    was unseen in the victim customer's prior history.
+    """
     customers, accounts, transactions = _sample_data()
-
-    original_devices = set(
-        transactions["device_id"]
-    )
 
     result = inject_card_testing(
         transactions,
@@ -441,17 +485,57 @@ def test_card_testing_uses_new_device():
         seed=42,
     )
 
-    fraud_devices = set(
-        result.loc[
-            result["fraud_type"]
-            == FRAUD_TYPE_CARD_TESTING,
-            "device_id",
-        ]
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_CARD_TESTING
+    ].copy()
+
+    assert not fraud.empty
+
+    legitimate_devices = set(
+        transactions["device_id"]
+        .dropna()
+        .astype(str)
     )
 
-    assert fraud_devices.isdisjoint(
-        original_devices
+    fraud_devices = set(
+        fraud["device_id"]
+        .dropna()
+        .astype(str)
     )
+
+    assert fraud_devices.issubset(
+        legitimate_devices
+    )
+
+    for scenario_id, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        customer_id = scenario["customer_id"].iloc[0]
+        fraud_start = pd.to_datetime(
+            scenario["timestamp"]
+        ).min()
+        fraud_device = str(
+            scenario["device_id"].iloc[0]
+        )
+
+        prior_history = transactions[
+            (transactions["customer_id"] == customer_id)
+            & (
+                pd.to_datetime(
+                    transactions["timestamp"]
+                )
+                < fraud_start
+            )
+        ]
+
+        prior_devices = set(
+            prior_history["device_id"]
+            .dropna()
+            .astype(str)
+        )
+
+        assert fraud_device not in prior_devices
 
 
 def test_card_testing_preserves_existing_fraud():
@@ -1302,3 +1386,203 @@ def test_balance_draining_is_reproducible():
         first.reset_index(drop=True),
         second.reset_index(drop=True),
     )
+
+def test_fraud_transaction_ids_match_legitimate_format():
+    """Fraud IDs must use the same format as legitimate IDs."""
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    fraud = result[
+        result["is_fraud"] == 1
+    ]
+
+    assert not fraud.empty
+
+    assert fraud["transaction_id"].str.fullmatch(
+        r"T\d{10}"
+    ).all()
+
+    assert not fraud["transaction_id"].str.contains(
+        "FRAUD",
+        case=False,
+        regex=False,
+    ).any()
+
+
+def test_all_transaction_ids_remain_unique():
+    """Fraud injection must not create transaction ID collisions."""
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    assert result["transaction_id"].is_unique
+
+
+def test_account_takeover_device_matches_legitimate_format():
+    """
+    ATO must reuse an identifier from the legitimate device
+    population instead of manufacturing a fraud-specific ID.
+    """
+    customers, accounts, transactions = _sample_data()
+
+    legitimate_devices = set(
+        transactions["device_id"]
+        .dropna()
+        .astype(str)
+    )
+
+    result = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    fraud_devices = set(
+        result.loc[
+            result["fraud_type"]
+            == FRAUD_TYPE_ACCOUNT_TAKEOVER,
+            "device_id",
+        ]
+        .dropna()
+        .astype(str)
+    )
+
+    assert fraud_devices
+    assert fraud_devices.issubset(
+        legitimate_devices
+    )
+
+    for device in fraud_devices:
+        assert "ATO" not in device.upper()
+        assert "FRAUD" not in device.upper()
+
+def test_card_testing_device_matches_legitimate_format():
+    """
+    Card Testing must reuse identifiers from the legitimate
+    device population instead of manufacturing fraud-specific
+    IDs.
+    """
+    customers, accounts, transactions = _sample_data()
+
+    legitimate_devices = set(
+        transactions["device_id"]
+        .dropna()
+        .astype(str)
+    )
+
+    result = inject_card_testing(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=1,
+        seed=42,
+    )
+
+    fraud_devices = set(
+        result.loc[
+            result["fraud_type"]
+            == FRAUD_TYPE_CARD_TESTING,
+            "device_id",
+        ]
+        .dropna()
+        .astype(str)
+    )
+
+    assert fraud_devices
+    assert fraud_devices.issubset(
+        legitimate_devices
+    )
+
+    for device in fraud_devices:
+        assert "CARD_TEST" not in device.upper()
+        assert "FRAUD" not in device.upper()
+
+def test_account_takeover_devices_are_new_to_each_victim():
+    """
+    Every ATO scenario must use exactly one device that was
+    unseen by that victim before the scenario began.
+
+    The same legitimate-population device may appear in more
+    than one scenario because global uniqueness is not a fraud
+    invariant.
+    """
+    customers, accounts, transactions = _sample_data()
+
+    result = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=2,
+        seed=42,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ].copy()
+
+    assert not fraud.empty
+
+    scenario_devices = (
+        fraud.groupby(
+            "fraud_scenario_id"
+        )["device_id"]
+        .nunique()
+    )
+
+    # Each individual scenario uses one attacker device.
+    assert (scenario_devices == 1).all()
+
+    legitimate_devices = set(
+        transactions["device_id"]
+        .dropna()
+        .astype(str)
+    )
+
+    for scenario_id, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        customer_id = scenario["customer_id"].iloc[0]
+        fraud_start = pd.to_datetime(
+            scenario["timestamp"]
+        ).min()
+        fraud_device = str(
+            scenario["device_id"].iloc[0]
+        )
+
+        # Device exists somewhere in legitimate data.
+        assert fraud_device in legitimate_devices
+
+        # But it was not known to this victim before fraud.
+        prior_history = transactions[
+            (transactions["customer_id"] == customer_id)
+            & (
+                pd.to_datetime(
+                    transactions["timestamp"]
+                )
+                < fraud_start
+            )
+        ]
+
+        prior_devices = set(
+            prior_history["device_id"]
+            .dropna()
+            .astype(str)
+        )
+
+        assert fraud_device not in prior_devices

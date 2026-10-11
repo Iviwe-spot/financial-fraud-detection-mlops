@@ -175,9 +175,33 @@ def inject_account_takeover(
             second=int(rng.integers(0, 60)),
         )
 
-        attacker_device = (
-            f"ATO_DEVICE_{scenario_number + 1:06d}"
+        attacker_device = _select_unseen_legitimate_device(
+            transactions=baseline,
+            customer_id=customer_id,
+            prior_to=start_timestamp,
+            rng=rng,
         )
+
+        # Reuse a legitimate online-purchase context so merchant
+        # and category values do not reveal the fraud label.
+        context_candidates = baseline[
+            (baseline["is_fraud"] == 0)
+            & (baseline["transaction_type"] == "PURCHASE")
+            & (baseline["channel"] == "ONLINE")
+        ]
+
+        # Defensive fallback: any legitimate purchase context.
+        if context_candidates.empty:
+            context_candidates = baseline[
+                (baseline["is_fraud"] == 0)
+                & (baseline["transaction_type"] == "PURCHASE")
+            ]
+
+        if context_candidates.empty:
+            raise ValueError(
+                "Account Takeover requires at least one "
+                "legitimate purchase transaction context"
+            )
 
         customer_average = max(
             float(customer["avg_transaction"]),
@@ -216,6 +240,15 @@ def inject_account_takeover(
                 )
 
             previous_timestamp = fraud_timestamp
+
+            context = context_candidates.iloc[
+                int(
+                    rng.integers(
+                        0,
+                        len(context_candidates),
+                    )
+                )
+            ]
 
             abnormal_multiplier = float(
                 rng.uniform(4.0, 9.0)
@@ -266,12 +299,12 @@ def inject_account_takeover(
                     "customer_id": customer_id,
                     "timestamp": fraud_timestamp,
                     "amount": amount,
-                    "merchant": (
-                        "UNKNOWN_ONLINE_MERCHANT"
-                    ),
-                    "merchant_category": (
-                        "ELECTRONICS"
-                    ),
+                    "merchant": context[
+                        "merchant"
+                    ],
+                    "merchant_category": context[
+                        "merchant_category"
+                    ],
                     "transaction_type": (
                         "PURCHASE"
                     ),
@@ -481,10 +514,30 @@ def inject_card_testing(
                 )
             )
 
-        attacker_device = (
-            f"CARD_TEST_DEVICE_"
-            f"{scenario_number + 1:06d}"
+        attacker_device = _select_unseen_legitimate_device(
+            transactions=baseline,
+            customer_id=customer_id,
+            prior_to=start_timestamp,
+            rng=rng,
         )
+
+        # Reuse legitimate online-purchase contexts so the
+        # merchant and category do not encode Card Testing.
+        context_candidates = legitimate[
+            (legitimate["transaction_type"] == "PURCHASE")
+            & (legitimate["channel"] == "ONLINE")
+        ]
+
+        if context_candidates.empty:
+            context_candidates = legitimate[
+                legitimate["transaction_type"] == "PURCHASE"
+            ]
+
+        if context_candidates.empty:
+            raise ValueError(
+                "Card Testing requires at least one legitimate "
+                "purchase transaction context"
+            )
 
         current_balance = float(
             account_history.iloc[-1][
@@ -510,6 +563,15 @@ def inject_card_testing(
                 )
 
             previous_timestamp = fraud_timestamp
+
+            context = context_candidates.iloc[
+                int(
+                    rng.integers(
+                        0,
+                        len(context_candidates),
+                    )
+                )
+            ]
 
             amount = round(
                 float(
@@ -552,12 +614,12 @@ def inject_card_testing(
                     "customer_id": customer_id,
                     "timestamp": fraud_timestamp,
                     "amount": amount,
-                    "merchant": (
-                        "UNKNOWN_TEST_MERCHANT"
-                    ),
-                    "merchant_category": (
-                        "ONLINE_SERVICES"
-                    ),
+                    "merchant": context[
+                        "merchant"
+                    ],
+                    "merchant_category": context[
+                        "merchant_category"
+                    ],
                     "transaction_type": (
                         "PURCHASE"
                     ),
@@ -857,14 +919,12 @@ def inject_velocity_attack(
             .unique()
         )
 
-        if len(known_devices) > 0:
-            device_id = str(
-                rng.choice(known_devices)
-            )
-        else:
-            device_id = (
-                f"KNOWN_DEVICE_{customer_id}"
-            )
+        if len(known_devices) == 0:
+            continue
+
+        device_id = str(
+            rng.choice(known_devices)
+        )
 
         # Use legitimate transaction contexts to avoid introducing
         # an artificial merchant or channel shortcut.
@@ -1310,15 +1370,12 @@ def inject_abnormal_amount(
             .unique()
         )
 
-        if len(known_devices) > 0:
-            device_id = str(
-                rng.choice(known_devices)
-            )
-        else:
-            device_id = (
-                f"ABNORMAL_AMOUNT_DEVICE_"
-                f"{scenario_number + 1:06d}"
-            )
+        if len(known_devices) == 0:
+            continue
+
+        device_id = str(
+            rng.choice(known_devices)
+        )
 
         # Reuse plausible legitimate transaction metadata only
         # from customer activity available before the fraud
@@ -1782,17 +1839,14 @@ def inject_geographic_anomaly(
             .unique()
         )
 
-        if len(known_devices) > 0:
-            device_id = str(
-                rng.choice(
-                    known_devices
-                )
+        if len(known_devices) == 0:
+            continue
+
+        device_id = str(
+            rng.choice(
+                known_devices
             )
-        else:
-            device_id = (
-                f"GEO_DEVICE_"
-                f"{scenario_number + 1:06d}"
-            )
+        )
 
         # -----------------------------------------------------
         # Reuse plausible legitimate transaction metadata
@@ -2156,15 +2210,12 @@ def inject_balance_draining(
             .unique()
         )
 
-        if len(known_devices) > 0:
-            device_id = str(
-                rng.choice(known_devices)
-            )
-        else:
-            device_id = (
-                f"DRAIN_DEVICE_"
-                f"{scenario_number + 1:06d}"
-            )
+        if len(known_devices) == 0:
+            continue
+
+        device_id = str(
+            rng.choice(known_devices)
+        )
 
         domestic_history = customer_history[
             (
@@ -2193,6 +2244,28 @@ def inject_balance_draining(
             )
             province = str(
                 customer["province"]
+            )
+
+        # Prefer legitimate transfer contexts so merchant,
+        # category and channel values overlap with normal data.
+        transfer_context_candidates = legitimate[
+            legitimate["transaction_type"] == "TRANSFER"
+        ]
+
+        # Small or synthetic test datasets may contain no
+        # legitimate transfers. In that case, reuse legitimate
+        # merchant/category values from the available history.
+        #
+        # The Balance Draining transaction still uses TRANSFER
+        # and EFT, but no fraud-only merchant/category value is
+        # introduced.
+        if transfer_context_candidates.empty:
+            transfer_context_candidates = legitimate.copy()
+
+        if transfer_context_candidates.empty:
+            raise ValueError(
+                "Balance Draining requires at least one "
+                "legitimate transaction context"
             )
 
         latest_timestamp = pd.Timestamp(
@@ -2274,6 +2347,19 @@ def inject_balance_draining(
                 2,
             )
 
+            transfer_context = (
+                transfer_context_candidates.iloc[
+                    int(
+                        rng.integers(
+                            0,
+                            len(
+                                transfer_context_candidates
+                            ),
+                        )
+                    )
+                ]
+            )
+
             fraudulent_rows.append(
                 {
                     "transaction_id": (
@@ -2285,12 +2371,21 @@ def inject_balance_draining(
                     "customer_id": customer_id,
                     "timestamp": current_timestamp,
                     "amount": amount,
-                    "merchant": "BANK_TRANSFER",
+                    "merchant": transfer_context[
+                        "merchant"
+                    ],
                     "merchant_category": (
-                        "MONEY_TRANSFER"
+                        transfer_context[
+                            "merchant_category"
+                        ]
                     ),
                     "transaction_type": "TRANSFER",
-                    "channel": "ONLINE",
+                    "channel": (
+                        transfer_context["channel"]
+                        if transfer_context["transaction_type"]
+                        == "TRANSFER"
+                        else "EFT"
+                    ),
                     "device_id": device_id,
                     "province": province,
                     "country": "South Africa",
@@ -2387,17 +2482,151 @@ def _get_eligible_accounts(
         )
     ].copy()
 
+def _next_transaction_ids(
+    existing_transactions: pd.DataFrame,
+    count: int,
+) -> list[str]:
+    """
+    Generate transaction IDs using the same format as the
+    legitimate transaction generator.
+
+    Example:
+        T0000000001
+        T0000000002
+
+    Existing IDs are inspected so newly generated IDs cannot
+    collide with legitimate or previously injected transactions.
+    """
+
+    if count <= 0:
+        return []
+
+    existing_ids = (
+        existing_transactions["transaction_id"]
+        .astype(str)
+    )
+
+    numeric_ids = (
+        existing_ids[
+            existing_ids.str.fullmatch(r"T\d{10}")
+        ]
+        .str[1:]
+        .astype(int)
+    )
+
+    if numeric_ids.empty:
+        next_number = 1
+    else:
+        next_number = int(numeric_ids.max()) + 1
+
+    return [
+        f"T{number:010d}"
+        for number in range(
+            next_number,
+            next_number + count,
+        )
+    ]
+
+
+def _select_unseen_legitimate_device(
+    transactions: pd.DataFrame,
+    customer_id: str,
+    prior_to: pd.Timestamp,
+    rng: np.random.Generator,
+) -> str:
+    """
+    Select a legitimate device that is new to the victim customer.
+
+    The selected device must:
+
+    1. already occur in legitimate transaction data,
+    2. not have been observed for the victim before prior_to,
+    3. contain no fraud-typology information.
+
+    This preserves customer-relative device novelty without
+    creating globally fraud-only device identifiers.
+    """
+
+    source = transactions.copy()
+
+    if "is_fraud" in source.columns:
+        source = source[
+            source["is_fraud"] == 0
+        ].copy()
+
+    source["timestamp"] = pd.to_datetime(
+        source["timestamp"]
+    )
+
+    global_devices = (
+        source["device_id"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+
+    if len(global_devices) == 0:
+        raise ValueError(
+            "No legitimate devices are available"
+        )
+
+    prior_customer_history = source[
+        (source["customer_id"] == customer_id)
+        & (
+            source["timestamp"]
+            < pd.Timestamp(prior_to)
+        )
+    ]
+
+    customer_devices = set(
+        prior_customer_history["device_id"]
+        .dropna()
+        .astype(str)
+    )
+
+    candidates = [
+        str(device)
+        for device in global_devices
+        if str(device) not in customer_devices
+    ]
+
+    if not candidates:
+        raise ValueError(
+            "No unseen legitimate device is available "
+            f"for customer {customer_id}"
+        )
+
+    selected_index = int(
+        rng.integers(
+            0,
+            len(candidates),
+        )
+    )
+
+    return candidates[selected_index]
+
 
 def _combine_baseline_and_fraud(
     baseline: pd.DataFrame,
     fraudulent_rows: list[dict],
 ) -> pd.DataFrame:
-    """Combine baseline and fraud transactions chronologically."""
+    """
+    Combine baseline and fraud transactions chronologically.
+
+    Fraud transactions receive identifiers using the same
+    T########## format as legitimate transactions so that the
+    transaction ID itself does not reveal the target class.
+    """
 
     if not fraudulent_rows:
         return baseline
 
     fraud = pd.DataFrame(fraudulent_rows)
+
+    fraud["transaction_id"] = _next_transaction_ids(
+        existing_transactions=baseline,
+        count=len(fraud),
+    )
 
     result = pd.concat(
         [baseline, fraud],
