@@ -9,3 +9,7 @@ data/sample/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/sample/.gitkeep
+
+# Databricks export datasets
+data/export/*
+!data/export/.gitkeep
