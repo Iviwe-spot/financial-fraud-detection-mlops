@@ -163,6 +163,11 @@ ABNORMAL_AMOUNT_ZSCORE_TOLERANCE = 0.01
 # GENERAL NUMERICAL TOLERANCE
 # =====================================================================
 
+ATO_MIN_TRANSACTIONS = 2
+ATO_MAX_TRANSACTIONS = 5
+ATO_MIN_GAP_MINUTES = 1
+ATO_MAX_GAP_MINUTES = 5
+
 BALANCE_TOLERANCE = 0.01
 
 
@@ -814,6 +819,599 @@ def validate_amounts_and_balances(
 # =====================================================================
 # BALANCE DRAINING VALIDATION
 # =====================================================================
+
+
+
+
+def _validation_hour_is_usual(
+    hour: int,
+    usual_start: int,
+    usual_end: int,
+) -> bool:
+    """Return whether an hour falls inside a customer's usual window."""
+
+    if usual_start <= usual_end:
+        return usual_start <= hour <= usual_end
+
+    # Overnight activity window, e.g. 22:00-06:00.
+    return (
+        hour >= usual_start
+        or hour <= usual_end
+    )
+
+
+def validate_account_takeover(
+    transactions: pd.DataFrame,
+    customers: pd.DataFrame,
+) -> ValidationReport:
+    """
+    Independently validate persisted Account Takeover scenarios.
+
+    Expected behavioural signature:
+    - 2-5 fraud transactions per scenario
+    - exactly one account and customer per scenario
+    - exactly one attacker device per scenario
+    - attacker device absent from prior legitimate customer history
+    - fraud begins outside the customer's usual activity window
+    - rapid 1-5 minute inter-transaction gaps
+    - positive transaction amounts
+    - internally reconciled balances
+    - continuous scenario balances
+    - non-negative balances
+
+    Large transaction amounts are reported diagnostically rather than
+    enforced as a hard invariant because the generator caps transaction
+    amounts at the account's available balance.
+    """
+
+    report = ValidationReport(
+        "ACCOUNT TAKEOVER"
+    )
+
+    fraud = (
+        transactions[
+            transactions["fraud_type"]
+            == "ACCOUNT_TAKEOVER"
+        ]
+        .copy()
+    )
+
+    if fraud.empty:
+        report.fail_check(
+            "Account Takeover scenarios exist",
+            "No ACCOUNT_TAKEOVER transactions found",
+        )
+        return report
+
+    fraud["timestamp"] = pd.to_datetime(
+        fraud["timestamp"]
+    )
+
+    legitimate = (
+        transactions[
+            transactions["is_fraud"] == 0
+        ]
+        .copy()
+    )
+
+    legitimate["timestamp"] = pd.to_datetime(
+        legitimate["timestamp"]
+    )
+
+    customer_profiles = (
+        customers[
+            [
+                "customer_id",
+                "avg_transaction",
+                "std_transaction",
+                "usual_start_hour",
+                "usual_end_hour",
+            ]
+        ]
+        .drop_duplicates("customer_id")
+        .copy()
+    )
+
+    # ----------------------------------------------------------
+    # Scenario size
+    # ----------------------------------------------------------
+
+    scenario_sizes = (
+        fraud
+        .groupby("fraud_scenario_id")
+        .size()
+    )
+
+    valid_sizes = scenario_sizes.between(
+        ATO_MIN_TRANSACTIONS,
+        ATO_MAX_TRANSACTIONS,
+    ).all()
+
+    if valid_sizes:
+        report.pass_check(
+            "Account Takeover scenario size",
+            (
+                f"All {len(scenario_sizes)} scenarios contain "
+                f"{ATO_MIN_TRANSACTIONS}-"
+                f"{ATO_MAX_TRANSACTIONS} transactions"
+            ),
+        )
+    else:
+        invalid = scenario_sizes[
+            ~scenario_sizes.between(
+                ATO_MIN_TRANSACTIONS,
+                ATO_MAX_TRANSACTIONS,
+            )
+        ]
+
+        report.fail_check(
+            "Account Takeover scenario size",
+            (
+                f"{len(invalid)} scenarios fall outside "
+                f"{ATO_MIN_TRANSACTIONS}-"
+                f"{ATO_MAX_TRANSACTIONS} transactions"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # Account / customer / device consistency
+    # ----------------------------------------------------------
+
+    account_counts = (
+        fraud
+        .groupby("fraud_scenario_id")["account_id"]
+        .nunique()
+    )
+
+    if account_counts.eq(1).all():
+        report.pass_check(
+            "Account Takeover account consistency",
+            "Each scenario uses exactly one account",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover account consistency",
+            (
+                f"{int((account_counts != 1).sum())} scenarios "
+                "use multiple accounts"
+            ),
+        )
+
+    customer_counts = (
+        fraud
+        .groupby("fraud_scenario_id")["customer_id"]
+        .nunique()
+    )
+
+    if customer_counts.eq(1).all():
+        report.pass_check(
+            "Account Takeover customer consistency",
+            "Each scenario uses exactly one customer",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover customer consistency",
+            (
+                f"{int((customer_counts != 1).sum())} scenarios "
+                "use multiple customers"
+            ),
+        )
+
+    device_counts = (
+        fraud
+        .groupby("fraud_scenario_id")["device_id"]
+        .nunique()
+    )
+
+    if device_counts.eq(1).all():
+        report.pass_check(
+            "Account Takeover device consistency",
+            "Each scenario uses exactly one attacker device",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover device consistency",
+            (
+                f"{int((device_counts != 1).sum())} scenarios "
+                "use multiple devices"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # Chronology and rapid transaction gaps
+    # ----------------------------------------------------------
+
+    chronology_failures = 0
+    gap_failures = 0
+    observed_gaps: list[float] = []
+
+    for _, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        scenario = scenario.sort_values(
+            "timestamp"
+        )
+
+        timestamps = scenario[
+            "timestamp"
+        ].reset_index(drop=True)
+
+        if len(timestamps) <= 1:
+            continue
+
+        gaps = (
+            timestamps
+            .diff()
+            .dropna()
+            .dt.total_seconds()
+            / 60.0
+        )
+
+        observed_gaps.extend(
+            gaps.tolist()
+        )
+
+        if not (gaps > 0).all():
+            chronology_failures += 1
+
+        if not gaps.between(
+            ATO_MIN_GAP_MINUTES,
+            ATO_MAX_GAP_MINUTES,
+        ).all():
+            gap_failures += 1
+
+    if chronology_failures == 0:
+        report.pass_check(
+            "Account Takeover chronological sequence",
+            "All scenario timestamps increase strictly",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover chronological sequence",
+            (
+                f"{chronology_failures} scenarios contain "
+                "non-increasing timestamps"
+            ),
+        )
+
+    if gap_failures == 0:
+        report.pass_check(
+            "Account Takeover rapid transaction gaps",
+            (
+                "All inter-transaction gaps are between "
+                f"{ATO_MIN_GAP_MINUTES} and "
+                f"{ATO_MAX_GAP_MINUTES} minutes"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover rapid transaction gaps",
+            (
+                f"{gap_failures} scenarios contain gaps outside "
+                f"{ATO_MIN_GAP_MINUTES}-"
+                f"{ATO_MAX_GAP_MINUTES} minutes"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # Transaction and balance reconciliation
+    # ----------------------------------------------------------
+
+    expected_after = (
+        fraud["balance_before"]
+        - fraud["amount"]
+    )
+
+    reconciliation_error = (
+        fraud["balance_after"]
+        - expected_after
+    ).abs()
+
+    reconciliation_ok = (
+        reconciliation_error
+        <= BALANCE_TOLERANCE
+    ).all()
+
+    if reconciliation_ok:
+        report.pass_check(
+            "Account Takeover transaction reconciliation",
+            (
+                "balance_after = balance_before - amount "
+                f"within R{BALANCE_TOLERANCE:.2f}"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover transaction reconciliation",
+            (
+                f"{int((reconciliation_error > BALANCE_TOLERANCE).sum())} "
+                "transactions fail reconciliation"
+            ),
+        )
+
+    continuity_failures = 0
+
+    for _, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        scenario = (
+            scenario
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+        if len(scenario) <= 1:
+            continue
+
+        previous_after = (
+            scenario["balance_after"]
+            .shift(1)
+            .iloc[1:]
+            .reset_index(drop=True)
+        )
+
+        next_before = (
+            scenario["balance_before"]
+            .iloc[1:]
+            .reset_index(drop=True)
+        )
+
+        differences = (
+            next_before - previous_after
+        ).abs()
+
+        if not (
+            differences <= BALANCE_TOLERANCE
+        ).all():
+            continuity_failures += 1
+
+    if continuity_failures == 0:
+        report.pass_check(
+            "Account Takeover balance continuity",
+            (
+                "Each transaction starts from the previous "
+                "transaction's ending balance"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover balance continuity",
+            (
+                f"{continuity_failures} scenarios contain "
+                "balance discontinuities"
+            ),
+        )
+
+    if fraud["amount"].gt(0).all():
+        report.pass_check(
+            "Account Takeover positive amounts",
+            "All fraud transaction amounts are positive",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover positive amounts",
+            (
+                f"{int((fraud['amount'] <= 0).sum())} "
+                "transactions have non-positive amounts"
+            ),
+        )
+
+    if (
+        fraud["balance_before"].ge(0).all()
+        and fraud["balance_after"].ge(0).all()
+    ):
+        report.pass_check(
+            "Account Takeover non-negative balances",
+            "All scenario balances remain non-negative",
+        )
+    else:
+        report.fail_check(
+            "Account Takeover non-negative balances",
+            "Negative scenario balances detected",
+        )
+
+    # ----------------------------------------------------------
+    # Point-in-time attacker device novelty
+    # ----------------------------------------------------------
+
+    device_failures = 0
+
+    for scenario_id, scenario in fraud.groupby(
+        "fraud_scenario_id"
+    ):
+        scenario = scenario.sort_values(
+            "timestamp"
+        )
+
+        first = scenario.iloc[0]
+
+        prior_devices = set(
+            legitimate.loc[
+                (
+                    legitimate["customer_id"]
+                    == first["customer_id"]
+                )
+                & (
+                    legitimate["timestamp"]
+                    < first["timestamp"]
+                ),
+                "device_id",
+            ]
+            .dropna()
+            .astype(str)
+        )
+
+        fraud_devices = set(
+            scenario["device_id"]
+            .dropna()
+            .astype(str)
+        )
+
+        if not fraud_devices.isdisjoint(
+            prior_devices
+        ):
+            device_failures += 1
+
+    if device_failures == 0:
+        report.pass_check(
+            "Account Takeover attacker device novelty",
+            (
+                "Scenario devices are absent from prior "
+                "legitimate customer history"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover attacker device novelty",
+            (
+                f"{device_failures} scenarios reuse a device "
+                "seen in prior legitimate customer history"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # Customer activity window
+    # ----------------------------------------------------------
+
+    first_transactions = (
+        fraud
+        .sort_values("timestamp")
+        .groupby(
+            "fraud_scenario_id",
+            as_index=False,
+        )
+        .first()
+    )
+
+    first_transactions = (
+        first_transactions.merge(
+            customer_profiles,
+            on="customer_id",
+            how="left",
+        )
+    )
+
+    missing_profiles = (
+        first_transactions[
+            [
+                "usual_start_hour",
+                "usual_end_hour",
+            ]
+        ]
+        .isna()
+        .any(axis=1)
+    )
+
+    if not missing_profiles.any():
+        report.pass_check(
+            "Account Takeover customer profile",
+            (
+                "Every scenario has customer activity-window "
+                "parameters"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover customer profile",
+            (
+                f"{int(missing_profiles.sum())} scenarios lack "
+                "activity-window parameters"
+            ),
+        )
+
+    unusual_failures = 0
+
+    for _, row in first_transactions[
+        ~missing_profiles
+    ].iterrows():
+        hour = int(
+            pd.Timestamp(row["timestamp"]).hour
+        )
+
+        usual_start = int(
+            row["usual_start_hour"]
+        )
+
+        usual_end = int(
+            row["usual_end_hour"]
+        )
+
+        if _validation_hour_is_usual(
+            hour=hour,
+            usual_start=usual_start,
+            usual_end=usual_end,
+        ):
+            unusual_failures += 1
+
+    if unusual_failures == 0:
+        report.pass_check(
+            "Account Takeover unusual activity window",
+            (
+                "All scenarios begin outside the customer's "
+                "usual activity window"
+            ),
+        )
+    else:
+        report.fail_check(
+            "Account Takeover unusual activity window",
+            (
+                f"{unusual_failures} scenarios begin within "
+                "the customer's usual activity window"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # Customer-relative amount diagnostics
+    # ----------------------------------------------------------
+
+    amount_profile = fraud.merge(
+        customer_profiles[
+            [
+                "customer_id",
+                "avg_transaction",
+                "std_transaction",
+            ]
+        ],
+        on="customer_id",
+        how="left",
+    )
+
+    valid_average = (
+        amount_profile["avg_transaction"]
+        .notna()
+        & amount_profile["avg_transaction"].gt(0)
+    )
+
+    amount_ratios = (
+        amount_profile.loc[
+            valid_average,
+            "amount",
+        ]
+        / amount_profile.loc[
+            valid_average,
+            "avg_transaction",
+        ]
+    )
+
+    if not amount_ratios.empty:
+        report.pass_check(
+            "Account Takeover observed amount-to-average range",
+            (
+                f"{amount_ratios.min():.2f}x to "
+                f"{amount_ratios.max():.2f}x"
+            ),
+        )
+
+    if observed_gaps:
+        report.pass_check(
+            "Account Takeover observed gap range",
+            (
+                f"{min(observed_gaps):.0f} to "
+                f"{max(observed_gaps):.0f} minutes"
+            ),
+        )
+
+    return report
 
 
 def validate_balance_draining(
@@ -3195,6 +3793,10 @@ def main():
     ]
 
     behavioural_reports = [
+        validate_account_takeover(
+            transactions,
+            customers,
+        ),
         validate_balance_draining(
             transactions
         ),
