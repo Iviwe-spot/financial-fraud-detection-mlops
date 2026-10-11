@@ -165,6 +165,92 @@ def test_account_takeover_adds_fraud():
     assert result["is_fraud"].sum() >= 1
 
 
+def test_account_takeover_generates_complete_affordable_scenarios():
+    """
+    Regression test for ATO scenario truncation.
+
+    A selected victim must have sufficient balance for the complete
+    customer-relative fraud sequence. Generated scenarios must never
+    be truncated below the configured minimum or padded with
+    artificial tiny transactions.
+    """
+    customers, accounts, transactions = _sample_data()
+
+    requested_scenarios = 2
+    minimum_transactions = 2
+    maximum_transactions = 5
+
+    result = inject_account_takeover(
+        transactions,
+        accounts,
+        customers,
+        n_scenarios=requested_scenarios,
+        min_transactions=minimum_transactions,
+        max_transactions=maximum_transactions,
+        seed=42,
+    )
+
+    fraud = result[
+        result["fraud_type"]
+        == FRAUD_TYPE_ACCOUNT_TAKEOVER
+    ].copy()
+
+    assert not fraud.empty
+
+    scenario_sizes = fraud.groupby(
+        "fraud_scenario_id"
+    ).size()
+
+    # Every requested scenario must be realised.
+    assert fraud[
+        "fraud_scenario_id"
+    ].nunique() == requested_scenarios
+
+    # No scenario may be truncated below the requested minimum
+    # or exceed the configured maximum.
+    assert (
+        scenario_sizes
+        >= minimum_transactions
+    ).all()
+
+    assert (
+        scenario_sizes
+        <= maximum_transactions
+    ).all()
+
+    # Every ATO transaction must retain the designed lower-bound
+    # customer-relative abnormal amount of 4x the normal average.
+    customer_averages = customers.set_index(
+        "customer_id"
+    )["avg_transaction"]
+
+    expected_minimum = (
+        fraud["customer_id"]
+        .map(customer_averages)
+        .clip(lower=1.0)
+        * 4.0
+    )
+
+    assert (
+        fraud["amount"]
+        >= expected_minimum
+    ).all()
+
+    # Balance accounting must remain valid throughout the sequence.
+    assert (
+        (
+            fraud["balance_before"]
+            - fraud["amount"]
+            - fraud["balance_after"]
+        ).abs()
+        <= 0.01
+    ).all()
+
+    assert (
+        fraud["balance_after"] >= 0
+    ).all()
+
+
 def test_legitimate_transactions_remain_legitimate():
     customers, accounts, transactions = _sample_data()
 

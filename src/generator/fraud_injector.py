@@ -64,10 +64,90 @@ def inject_account_takeover(
         accounts=account_master,
     )
 
+    # Obtain the latest legitimate balance for every eligible account.
+    # ATO scenarios must contain at least min_transactions plausible
+    # customer-relative transactions, so victim selection must account
+    # for available funds before scenario construction begins.
+    latest_balances = (
+        baseline
+        .sort_values("timestamp")
+        .groupby(
+            "account_id",
+            as_index=False,
+        )
+        .tail(1)[
+            [
+                "account_id",
+                "balance_after",
+            ]
+        ]
+        .rename(
+            columns={
+                "balance_after": "latest_balance"
+            }
+        )
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        latest_balances,
+        on="account_id",
+        how="inner",
+    )
+
+    eligible_accounts = eligible_accounts.merge(
+        customer_master[
+            [
+                "customer_id",
+                "avg_transaction",
+            ]
+        ],
+        on="customer_id",
+        how="inner",
+    )
+
+    # The ATO generator uses an abnormal multiplier starting at 4x.
+    # Require enough balance for at least the configured minimum number
+    # of transactions at that lower-bound abnormal amount.
+    eligible_accounts[
+        "minimum_ato_amount"
+    ] = (
+        eligible_accounts["avg_transaction"]
+        .astype(float)
+        .clip(lower=1.0)
+        * 4.0
+    )
+
+    eligible_accounts[
+        "max_affordable_transactions"
+    ] = (
+        eligible_accounts["latest_balance"]
+        / eligible_accounts["minimum_ato_amount"]
+    ).apply(np.floor).astype(int)
+
+    eligible_accounts[
+        "max_affordable_transactions"
+    ] = (
+        eligible_accounts[
+            "max_affordable_transactions"
+        ]
+        .clip(
+            lower=0,
+            upper=max_transactions,
+        )
+    )
+
+    eligible_accounts = eligible_accounts[
+        eligible_accounts[
+            "max_affordable_transactions"
+        ]
+        >= min_transactions
+    ].copy()
+
     if n_scenarios > len(eligible_accounts):
         raise ValueError(
             "n_scenarios cannot exceed the number of "
-            "eligible active accounts"
+            "ATO-eligible active accounts with sufficient "
+            "balance for the minimum scenario size"
         )
 
     victim_indices = rng.choice(
@@ -116,10 +196,14 @@ def inject_account_takeover(
             f"ATO_{scenario_number + 1:06d}"
         )
 
+        affordable_max_transactions = int(
+            victim["max_affordable_transactions"]
+        )
+
         number_of_transactions = int(
             rng.integers(
                 min_transactions,
-                max_transactions + 1,
+                affordable_max_transactions + 1,
             )
         )
 
@@ -265,13 +349,40 @@ def inject_account_takeover(
                 )
             )
 
+            # Preserve enough balance for the remaining ATO
+            # transactions at the lower-bound abnormal amount. Unlike
+            # penny reservation, this keeps every transaction
+            # behaviourally plausible relative to the customer.
+            remaining_transactions = (
+                number_of_transactions
+                - sequence_number
+                - 1
+            )
+
+            minimum_ato_amount = (
+                customer_average * 4.0
+            )
+
+            reserved_balance = (
+                remaining_transactions
+                * minimum_ato_amount
+            )
+
+            maximum_current_amount = (
+                current_balance
+                - reserved_balance
+            )
+
             amount = min(
                 proposed_amount,
-                current_balance,
+                maximum_current_amount,
             )
 
             amount = round(
-                max(amount, 0.01),
+                max(
+                    amount,
+                    minimum_ato_amount,
+                ),
                 2,
             )
 
